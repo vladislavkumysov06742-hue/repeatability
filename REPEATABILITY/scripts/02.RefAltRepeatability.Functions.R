@@ -28,9 +28,13 @@ analyze_mtDNA_repeats <- function(fasta_path,
   }
   
   # Motif extraction helper
+  # Функция для извлечения мотива вокруг заданной позиции
   get_motif_around_position <- function(seq, pos, left_flank, right_flank) {
+    # start_pos не может быть меньше 1 (левый край последовательности)
     start_pos <- max(pos - left_flank, 1)
+    # end_pos не может превышать длину цепочки
     end_pos <- min(pos + right_flank, length(seq))
+    # subseq — Biostrings-утилита для извлечения подстроки (DNAString)
     subseq(seq, start = start_pos, end = end_pos)
   }
   

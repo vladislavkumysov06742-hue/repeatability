@@ -29,7 +29,30 @@ else:
 
 # Prepare small fasta
 fasta = tmp / "test.fasta"
-seq = ("ACGT" * 500)[:2000]
+# Try to compose a more realistic mtDNA-like sequence by taking a 2000-nt slice
+# from the repository's Homo_sapients.mtDNA.fasta if it exists. Otherwise fall back
+# to a simple repetitive sequence.
+mt_fa = repo_root / "data" / "1_raw" / "Homo_sapients.mtDNA.fasta"
+if mt_fa.exists():
+    seq_lines = []
+    with mt_fa.open('r', encoding='utf-8') as fh:
+        for line in fh:
+            if line.startswith('>'):
+                continue
+            seq_lines.append(line.strip())
+    full_seq = ''.join(seq_lines)
+    if len(full_seq) >= 2000:
+        # take a slice starting at 500 (arbitrary, avoids very beginning)
+        start = 500 if len(full_seq) >= 2500 else 0
+        seq = full_seq[start:start+2000]
+        print(f"Using real mtDNA slice from {mt_fa} (start={start})")
+    else:
+        seq = ("ACGT" * 500)[:2000]
+        print(f"Real mtDNA found but too short ({len(full_seq)} nt), using fallback")
+else:
+    seq = ("ACGT" * 500)[:2000]
+    print("Real mtDNA fasta not found, using simple repetitive fallback")
+
 fasta.write_text(">test\n" + seq + "\n")
 
 pos = 100
@@ -63,7 +86,7 @@ print('R finished.')
 sys.path.insert(0, str(py_dir))
 from src.analysis import analyze_mtDNA_repeats
 print('Running Python analyze_mtDNA_repeats...')
-analyze_mtDNA_repeats(str(fasta), pos, ref, alt, output_path=str(tmp), output_prefix=outpref)
+analyze_mtDNA_repeats(str(fasta), pos, ref, alt, output_path=str(tmp), output_prefix=outpref, debug=True)
 print('Python finished.')
 
 # Paths to outputs
@@ -123,9 +146,9 @@ for allele, r_file, py_file in ((ref, rA, pyA), (alt, rG, pyG)):
     # pad shorter with empty rows
     max_rows = max(len(r_s), len(py_s))
     if len(r_s) < max_rows:
-        r_s = pd.concat([r_s, pd.DataFrame([[''] * len(all_cols)] * (max_rows - len(r_s),), columns=all_cols)], ignore_index=True)
+        r_s = pd.concat([r_s, pd.DataFrame([[''] * len(all_cols)] * (max_rows - len(r_s)), columns=all_cols)], ignore_index=True)
     if len(py_s) < max_rows:
-        py_s = pd.concat([py_s, pd.DataFrame([[''] * len(all_cols)] * (max_rows - len(py_s),), columns=all_cols)], ignore_index=True)
+        py_s = pd.concat([py_s, pd.DataFrame([[''] * len(all_cols)] * (max_rows - len(py_s)), columns=all_cols)], ignore_index=True)
 
     mismatch = (r_s.values != py_s.values)
     any_mismatch = mismatch.any()

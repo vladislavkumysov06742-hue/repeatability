@@ -1,26 +1,30 @@
 
-# Install if needed:
-# install.packages(c("ggplot2", "dplyr", "scales"))
+## Install if needed:
+## install.packages(c("ggplot2", "dplyr", "scales"))
 
-library(ggplot2)
-library(dplyr)
-library(scales)
+## Подключаем библиотеки
+library(ggplot2)  # графики
+library(dplyr)    # манипуляции с таблицами
+library(scales)   # вспомогательные функции для визуализации
 
-# Genome and parameters
-MTDNA_LENGTH <- 16568
-radius <- 1
+## Параметры для круга генома
+MTDNA_LENGTH <- 16568  # ожидаемая длина человеческой митохондриальной ДНК
+radius <- 1            # радиус круга для отрисовки (произвольная единица)
 
-# Load your repeat data (edit path as needed)
-repeats <- read.csv("/home/popadin/Documents/REPEATABILITY/data/2_derived/pos8473_TtoC/my_mtDNA_repeat_all_repeats.csv")
+## Загружаем результаты поиска повторов
+## ЗАМЕНА ПУТИ: в оригинальном скрипте путь был абсолютный и специфичен для машины разработчика.
+## Здесь использован относительный путь, подходящий для этого репозитория.
+repeats <- read.csv("../data/2_derived/pos8473_TtoC/my_mtDNA_repeat_all_repeats.csv")
 
-# Filter: keep only 16 bp and 15 bp repeats
+## Фильтруем по длине EffectiveLength — оставляем только 15 и 16 (пример визуализации)
 repeats <- repeats %>% filter(EffectiveLength %in% c(16, 15))
 
 if (nrow(repeats) == 0) stop("No 15 or 16 bp repeats found in your file!")
 
-# Helper: mtDNA position (1 at top, clockwise)
+## angle_for_pos переводит позицию в угол (радианы) на круге, где позиция 1 располагается сверху
 angle_for_pos <- function(pos) (0.5 - (pos-1)/MTDNA_LENGTH) * 2 * pi
 
+## Добавляем вспомогательные координаты: углы и x/y для позиции и центра повтора
 repeats <- repeats %>%
   mutate(
     angle_pos = angle_for_pos(pos),
@@ -40,27 +44,28 @@ repeats <- repeats %>%
     arc_label = paste0(arc_type, "<br>repeat: ", repeat.start, "-", repeat.end)
   )
 
-# Genome circle
+## Подготавливаем траекторию круга
 n_points <- 400
 circle_path <- data.frame(x = cos(seq(0, 2*pi, length.out=n_points)) * radius,
                           y = sin(seq(0, 2*pi, length.out=n_points)) * radius)
 
-# Where is position 1?
+## Отмечаем позицию 1 на круге
 angle_1 <- angle_for_pos(1)
 x1 <- cos(angle_1) * radius
 y1 <- sin(angle_1) * radius
 
-# Where is "pos"?
+## Координаты варианта (предполагаем, что во всех строках repeats одна и та же pos)
 variant_angle <- angle_for_pos(repeats$pos[1])
 x_pos <- cos(variant_angle) * radius
 y_pos <- sin(variant_angle) * radius
 
-# Create arcs as quadratic Béziers (visually pleasing and simple)
+## Функция для построения квадратичной кривой (Bézier) между двумя точками
 make_arc_df <- function(x0, y0, x1, y1, arc_color, arc_thick, arc_type, arc_label, n=50, curve=0.37) {
+  # xm, ym — середина отрезка; затем строим контрольную точку для кривой
   xm <- (x0 + x1)/2
   ym <- (y0 + y1)/2
-  # Outward control point
   dx <- x1 - x0; dy <- y1 - y0
+  # сдвиг контрольной точки в наружную сторону круга для более "пышной" дуги
   ctrl_x <- xm - dy * curve
   ctrl_y <- ym + dx * curve
   t <- seq(0, 1, length.out = n)
@@ -71,6 +76,8 @@ make_arc_df <- function(x0, y0, x1, y1, arc_color, arc_thick, arc_type, arc_labe
     group = paste0(x0, "_", y0, "_", x1, "_", y1, "_", arc_color)
   )
 }
+
+## Собираем все дуги в один датафрейм
 arcs_df <- bind_rows(lapply(1:nrow(repeats), function(i) {
   make_arc_df(
     repeats$x_pos[i], repeats$y_pos[i], repeats$x_rep[i], repeats$y_rep[i],
@@ -78,17 +85,13 @@ arcs_df <- bind_rows(lapply(1:nrow(repeats), function(i) {
     arc_type = repeats$arc_type[i], arc_label = repeats$arc_label[i])
 }))
 
-# Final Plot
+## Рисуем итоговую фигуру
 ggplot() +
-  # mtDNA circle
   geom_path(data = circle_path, aes(x = x, y = y), color = "gray30", linewidth = 2) +
-  # Position 1
   geom_point(aes(x=x1, y=y1), color="black", size=5) +
   geom_text(aes(x=x1, y=y1), label = "1", vjust = -1.3, fontface = "bold", size = 5) +
-  # Variant pos (big golden dot and position number)
   geom_point(aes(x=x_pos, y=y_pos), color="goldenrod", size=7) +
   geom_text(aes(x=x_pos, y=y_pos), label = unique(repeats$pos), nudge_y=0.11, fontface="bold", size=5.1, color="black") +
-  # Repeat arcs
   geom_path(
     data = arcs_df,
     aes(x = x, y = y, group = group, color = arc_type, linewidth = arc_thick),

@@ -1,0 +1,423 @@
+---
+title: "Calculate repeatability for Ref and Alt alleles within human mtDNA — annotated"
+author: "Константин Попадин — аннотированная версия"
+date: "29/07/2025"
+output:
+  html_document: default
+  pdf_document: default
+---
+
+```{r setup, include=FALSE}
+# Настройка документа и окружения
+# knitr будет показывать код рядом с выводом (echo = TRUE)
+knitr::opts_chunk$set(echo = TRUE)
+# Чистим рабочее пространство, чтобы примеры запускались в детерминированной среде
+rm(list=ls(all=TRUE))
+
+# Подключаем библиотеки. Если их нет — установить через install.packages() или BiocManager::install().
+# Biostrings и IRanges — из Bioconductor, остальное — CRAN.
+library(knitr)
+library(tidyverse)
+library(kableExtra)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(Biostrings)
+library(stringdist) # install.packages("stringdist")
+library(IRanges)
+
+# Примечание для новичка:
+# - Biostrings: удобные структуры для хранения и манипуляции ДНК-последовательностями (DNAString, DNAStringSet).
+# - stringdist: различные метрики расстояний между строками, здесь используется Hamming distance.
+# - IRanges: работа с интервалами (start/end) — полезно при фильтрации вложенных повторов.
+```
+
+## Background
+
+Краткое описание: документ демонстрирует шаги по извлечению мотивов вокруг позиции (pos),
+поиску похожих повторов по всей последовательности, обработке Ref/Alt аллелей и агрегации результатов.
+
+## 1. Read mtDNA RefSeq fasta
+
+***
+```{r}
+# Источник: https://www.ncbi.nlm.nih.gov/nuccore/NC_012920.1?report=fasta
+# Файл должен быть сохранён в `data/1_raw/Homo_sapients.mtDNA.fasta`.
+
+# readDNAStringSet читает FASTA и возвращает объект DNAStringSet
+mtDNA <- readDNAStringSet("../data/1_raw/Homo_sapients.mtDNA.fasta")
+# Извлекаем первую запись (для референса ожидается одна запись)
+mtDNA_seq <- mtDNA[[1]]
+# Показываем длину последовательности (число нуклеотидов)
+length(mtDNA_seq)
+# Показываем первые 100 нуклеотидов для проверки
+mtDNA_seq[1:100]
+
+# Комментарий: если FASTA содержит несколько записей, код надо адаптировать.
+```
+
+## 2. QC the approach: extract motif and look for repeats
+
+```{r}
+#### EXTRACT MOTIF
+# Параметры: позиция интереса и размер фланка
+pos <- 8473
+flank <- 2  # number of nucleotides to each side
+
+# Строим начальные координаты мотива вокруг позиции
+start_pos <- pos - flank
+end_pos <- pos + flank
+
+# Убеждаемся, что не вышли за границы последовательности
+start_pos <- max(start_pos, 1)
+end_pos <- min(end_pos, length(mtDNA_seq))
+
+# Извлекаем мотив как DNAString
+motif <- subseq(mtDNA_seq, start=start_pos, end=end_pos)
+# Показываем мотив
+motif  # This is your motif (DNAString object)
+
+# Превращаем мотив в строку для операций со строками
+motif_str <- as.character(motif)
+# Длина мотива (здесь должна быть 2*flank + 1 = 5)
+motif_length <- nchar(motif_str)
+
+# Допустимое количество несовпадений (пример)
+max_mismatch <- 1  # set max allowed mismatches (e.g., 1 mismatch for 20%)
+
+# Генерируем все подстроки (k-mers) длины motif_length по всей последовательности
+seq_length <- length(mtDNA_seq)
+all_kmers <- substring(as.character(mtDNA_seq), 1:(seq_length - motif_length + 1), motif_length:(seq_length))
+
+# Вычисляем расстояния Хэмминга между мотивом и каждым k-mer
+# stringdist возвращает вектор чисел — количество различий
+distances <- stringdist(motif_str, all_kmers, method = "hamming")
+
+# Находим индексы, где расстояние <= max_mismatch
+matches_pos <- which(distances <= max_mismatch)
+
+# Извлекаем совпадающие k-mer'ы
+matched_kmers <- all_kmers[matches_pos]
+
+# Собираем таблицу результатов
+result <- data.frame(Position = matches_pos, Motif = matched_kmers, Distance = distances[matches_pos])
+# Размеры таблицы и содержимое
+dim(result)
+print(result)
+# Считаем количество точных и менее точных совпадений
+NumberOfPerfect = nrow(result[result$Distance == 0,])
+NumberOfDegraded = nrow(result[result$Distance == 1,])
+
+# Комментарии:
+# - Все позиции в matches_pos — это номера начала повторов в линейной последовательности.
+# - Для circular genome (если нужно) алгоритм надо менять — здесь предполагается линейный подход.
+```
+
+## 3. write a simple function - to extract motif from mtDNA and find all repeats
+
+```{r}
+##### get_motif_around_position
+# Мини-функция, возвращающая мотив вокруг позиции с указанными фланками
+seq = mtDNA_seq;
+pos = 8473;
+left_flank = 2;
+right_flank = 3;
+max_mismatch <- 1;
+get_motif_around_position <- function(seq, pos, left_flank, right_flank) {
+  # Используем max/min, чтобы не выйти за границы последовательности
+  start_pos <- max(pos - left_flank, 1)
+  end_pos <- min(pos + right_flank, length(seq))
+  subseq(seq, start=start_pos, end=end_pos)
+}
+motif <- get_motif_around_position(seq, pos, left_flank, right_flank)
+cat("Motif at position", pos, ":", as.character(motif), "\n")
+
+##### find_approximate_repeats
+# Функция, которая: 1) генерирует все k-mer подстроки; 2) считает расстояния; 3) возвращает найденные позиции
+max_mismatch = 1
+find_approximate_repeats <- function(seq, motif, max_mismatch) {
+  motif_str <- as.character(motif)
+  # width() используется для объектов Biostrings; nchar для строк — оба дают длину мотива
+  motif_length <- nchar(motif_str)
+  seq_length <- length(seq)
+  # Генерация всех подстрок (k-mers)
+  all_kmers <- substring(as.character(seq), 1:(seq_length - motif_length + 1), motif_length:(seq_length))
+  # Вычисление расстояний Хэмминга
+  distances <- stringdist(motif_str, all_kmers, method = "hamming")
+  matches_pos <- which(distances <= max_mismatch)
+  matched_kmers <- all_kmers[matches_pos]
+  # Возвращаем data.frame: позицию старта повтора, сам повтор и расстояние
+  data.frame(Position = matches_pos, Motif = matched_kmers, Distance = distances[matches_pos])
+}
+
+# Пример вызова
+results <- find_approximate_repeats(mtDNA_seq, motif, max_mismatch)
+
+# Комментарии:
+# - Если motif_length маленькая, max_mismatch может быть 0 (строгое соответствие).
+# - Функция возвращает позиции начала каждого совпадения и расстояние — этим можно фильтровать по качеству.
+```
+
+## 4. modify a function, so it can find extract all motifs, overlapping the position within the defined interval, and get repeats for all such motifs
+
+```{r}
+
+# Параметры для перебора мотивов (по умолчанию берём до 20 фланков в каждую сторону)
+seq <- mtDNA_seq
+pos <- 8473
+max_flank_left <- 20
+max_flank_right <- 20
+min_length <- 5
+max_length <- 41
+
+# Функции извлечения мотива и поиска повторов — такие же, как выше
+get_motif_around_position <- function(seq, pos, left_flank, right_flank) {
+  start_pos <- max(pos - left_flank, 1)
+  end_pos <- min(pos + right_flank, length(seq))
+  subseq(seq, start=start_pos, end=end_pos)
+}
+
+find_approximate_repeats <- function(seq, motif, max_mismatch) {
+  motif_str <- as.character(motif)
+  motif_length <- nchar(motif_str)
+  seq_length <- length(seq)
+  all_kmers <- substring(as.character(seq), 1:(seq_length - motif_length + 1), motif_length:(seq_length))
+  distances <- stringdist(motif_str, all_kmers, method = "hamming")
+  matches_pos <- which(distances <= max_mismatch)
+  matched_kmers <- all_kmers[matches_pos]
+  data.frame(
+    repeat.seq = matched_kmers,
+    repeat.start = matches_pos,
+    repeat.end = matches_pos + motif_length - 1,
+    repeat.hamming.distance = distances[matches_pos],
+    stringsAsFactors = FALSE
+  )
+}
+
+# Итоговый датафрейм, куда собираем все повторы для всех мотиваций
+all_motif_results <- data.frame()
+
+# Перебираем все длины мотива и все возможные асимметричные фланки
+for (motif_length in min_length:max_length) {
+  for (left_flank in 0:(motif_length-1)) {
+    right_flank <- motif_length - left_flank - 1
+    # Проверяем лимиты на фланки
+    if (left_flank <= max_flank_left && right_flank <= max_flank_right) {
+      motif_seq <- get_motif_around_position(seq, pos, left_flank, right_flank)
+      # Вычисляем допустимое число несовпадений (например 20%)
+      motif_string <- as.character(motif_seq)
+      this_length <- nchar(motif_string)
+      max_mismatch <- floor(0.2 * this_length)
+      # Ищем повторы для текущего мотива
+      repeats_df <- find_approximate_repeats(seq, motif_seq, max_mismatch)
+      if (nrow(repeats_df) > 0) {
+        repeats_df$motif.seq <- motif_string
+        repeats_df$motif.length <- this_length
+        repeats_df$motif.start <- max(pos - left_flank, 1)
+        repeats_df$motif.end <- min(pos + right_flank, length(seq))
+        # Упорядочим колонки для удобства
+        repeats_df <- repeats_df[, c(
+          "motif.seq", "motif.length", "motif.start", "motif.end",
+          "repeat.seq", "repeat.start", "repeat.end", "repeat.hamming.distance"
+        )]
+        all_motif_results <- rbind(all_motif_results, repeats_df)
+      }
+    }
+  }
+}
+
+# Комментарий:
+# - После этого шага у нас есть таблица со всеми найденными повторами для всех мотивов, которые перекрывают позицию pos.
+# - all_motif_results содержит информацию и о мотивах, и о расположении найденных повторов в геноме.
+
+```
+
+## 5. modify function, so it can work with Ref and Alt alleles
+
+```{r}
+
+# Определяем параметры, включая референсную и альтернативную букву
+seq <- mtDNA_seq  # Your reference sequence as DNAString
+pos <- 8473       # Variant position (1-based)
+ref_nuc <- "T"    # Reference nucleotide at 'pos'
+alt_nuc <- "C"    # Alternative nucleotide at 'pos'
+max_flank_left <- 20
+max_flank_right <- 20
+min_length <- 5
+max_length <- 41
+
+# Motif extraction с ассиметричными фланками
+get_motif_around_position <- function(seq, pos, left_flank, right_flank) {
+  start_pos <- max(pos - left_flank, 1)
+  end_pos <- min(pos + right_flank, length(seq))
+  subseq(seq, start=start_pos, end=end_pos)
+}
+
+# Repeat finding — та же логика, что и выше
+find_approximate_repeats <- function(seq, motif, max_mismatch) {
+  motif_str <- as.character(motif)
+  motif_length <- nchar(motif_str)
+  seq_length <- length(seq)
+  all_kmers <- substring(as.character(seq), 1:(seq_length - motif_length + 1), motif_length:(seq_length))
+  distances <- stringdist(motif_str, all_kmers, method = "hamming")
+  matches_pos <- which(distances <= max_mismatch)
+  matched_kmers <- all_kmers[matches_pos]
+  data.frame(
+    repeat.seq = matched_kmers,
+    repeat.start = matches_pos,
+    repeat.end = matches_pos + motif_length - 1,
+    repeat.hamming.distance = distances[matches_pos],
+    stringsAsFactors = FALSE
+  )
+}
+
+# Главная функция: собирает таблицу повторов для Ref и Alt
+get_repeatability_table <- function(input_seq, pos, ref_nuc, alt_nuc) {
+  all_results <- data.frame()
+  for (allele in c(ref_nuc, alt_nuc)) {
+    # Если рассматриваемая аллель — не референсная, заменяем нуклеотид в позиции
+    seq_allele <- input_seq
+    if (allele != ref_nuc) {
+      seq_char <- unlist(strsplit(as.character(input_seq), ""))
+      seq_char[pos] <- allele
+      seq_allele <- DNAString(paste(seq_char, collapse=""))
+    }
+    # Для каждой длины мотива и для всех фланков выполняем поиск
+    for (motif_length in min_length:max_length) {
+      for (left_flank in 0:(motif_length-1)) {
+        right_flank <- motif_length - left_flank - 1
+        if (left_flank <= max_flank_left && right_flank <= max_flank_right) {
+          motif_seq <- get_motif_around_position(seq_allele, pos, left_flank, right_flank)
+          motif_string <- as.character(motif_seq)
+          this_length <- nchar(motif_string)
+          # Допустимое число несовпадений — 20% от длины мотива
+          max_mismatch_allowed <- floor(0.2 * this_length)
+          repeats_df <- find_approximate_repeats(seq_allele, motif_seq, max_mismatch_allowed)
+          if (nrow(repeats_df) > 0) {
+            repeats_df$motif.seq <- motif_string
+            repeats_df$motif.length <- this_length
+            repeats_df$motif.start <- max(pos - left_flank, 1)
+            repeats_df$motif.end <- min(pos + right_flank, length(seq_allele))
+            repeats_df$nuc <- allele
+            repeats_df <- repeats_df[, c(
+              "nuc", "motif.seq", "motif.length", "motif.start", "motif.end",
+              "repeat.seq", "repeat.start", "repeat.end", "repeat.hamming.distance"
+            )]
+            all_results <- rbind(all_results, repeats_df)
+          }
+        }
+      }
+    }
+  }
+  return(all_results)
+}
+
+# Вызов функции и получение итоговой таблицы
+final_results <- get_repeatability_table(seq, pos, ref_nuc, alt_nuc)
+
+# Пояснение:
+# - final_results содержит строки с информацией о мотиве (включая какие нуклеотиды входят в мотив)
+#   и о каждом найденном повторе (start/end, hamming distance) для каждой аллели (nuc).
+```
+
+## 6. filter out redundancy: (i) remove rows, where motif is similar to itself; (ii) remove nested short repeats within the long ones
+
+```{r}
+##### FILTER 1: filter out rows where motif, i.e. region including the position, and repeat intervals overlap at any position (so there is no self reference)
+filtered_results <- final_results %>%
+  filter(motif.end < repeat.start | repeat.end < motif.start)
+
+#  effective longest repeat (length minus Hamming distance) in the major arc differing between Ref and Alt.
+
+filtered_results$EffectiveLength = filtered_results$motif.length - filtered_results$repeat.hamming.distance
+summary(filtered_results$EffectiveLength)
+
+####### FILTER 2: remove short repeats, nested within the longer ones:
+
+remove_nested_repeats <- function(repeats_df) {
+  filtered_repeats <- data.frame()
+  
+  for (allele in unique(repeats_df$nuc)) {
+    allele_repeats <- repeats_df[repeats_df$nuc == allele, ]
+    allele_repeats <- allele_repeats[order(-allele_repeats$EffectiveLength), ]
+    
+    kept_intervals <- IRanges() # empty set
+    
+    for (i in seq_len(nrow(allele_repeats))) {
+      current_start <- allele_repeats$repeat.start[i]
+      current_end   <- allele_repeats$repeat.end[i]
+      current_range <- IRanges(start = current_start, end = current_end)
+      
+      # Is current fully within any kept interval?
+      if (length(kept_intervals) == 0) {
+        is_nested <- FALSE
+      } else {
+        # Check if 'current_range' is strictly within any 'kept_interval'
+        is_nested <- any(start(current_range) >= start(kept_intervals) & 
+                         end(current_range) <= end(kept_intervals))
+      }
+      
+      if (!is_nested) {
+        filtered_repeats <- rbind(filtered_repeats, allele_repeats[i, ])
+        kept_intervals <- c(kept_intervals, current_range)
+      }
+    }
+  }
+  rownames(filtered_repeats) <- NULL
+  return(filtered_repeats)
+}
+
+non_nested_repeats <- remove_nested_repeats(filtered_results)
+
+# Комментарий:
+# - Первый фильтр убирает «самоповторы», где мотив и найденный повтор перекрываются.
+# - Второй фильтр удаляет полностью вложенные, короткие повторы в пользу более длинных независимых.
+```
+
+## 7. calculate repeatability proxy 1: effectively longest repeats within major arc
+
+```{r}
+
+##### remove all except major arc
+
+major_arc_start <- 5798
+major_arc_end <- 16568
+
+major_arc <- subset(
+  non_nested_repeats,
+  motif.start >= major_arc_start & motif.end <= major_arc_end &
+    repeat.start >= major_arc_start & repeat.end <= major_arc_end
+)
+
+#### estimate naive repeatability:
+# Find maximum EffectiveLength
+max_eff_len <- max(major_arc$EffectiveLength, na.rm = TRUE)
+
+# Set the range from max down to max-5 (stop at minimum 0 to avoid negative EffectiveLength)
+eff_len_values <- seq(max_eff_len, max(max_eff_len - 5, 0), by = -1)
+
+# Initialize an empty results data.frame
+results <- data.frame(
+  EffectiveLength = integer(),
+  Ref_Count = integer(),
+  Alt_Count = integer(),
+  stringsAsFactors = FALSE
+)
+
+for(eff_len in eff_len_values) {
+  ref_count <- nrow(filter(major_arc, EffectiveLength == eff_len, nuc == "T"))
+  alt_count <- nrow(filter(major_arc, EffectiveLength == eff_len, nuc == "C"))
+  
+  results <- rbind(results, data.frame(
+    EffectiveLength = eff_len,
+    Ref_Count = ref_count,
+    Alt_Count = alt_count
+  ))
+}
+
+print(results)
+
+temp15 = major_arc[major_arc$EffectiveLength >= 15,]
+
+# Конец документа — здесь можно добавлять визуализации, таблицы и дополнительные проверки
+```
