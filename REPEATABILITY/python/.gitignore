@@ -14,6 +14,11 @@ ENV/
 data/
 data/**
 
+# Pytest
+.pytest_cache/
+.pytest_tmp/
+*.tmp/
+
 # OS files
 Thumbs.db
 .DS_Store

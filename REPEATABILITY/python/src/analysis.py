@@ -1,4 +1,8 @@
-"""Core analysis: motif extraction, approximate repeat finding, filtering and repeatability summary."""
+"""Core analysis: motif extraction, approximate repeat finding, filtering and repeatability summary.
+
+Этот модуль реализует Python-версию логики, аналогичной R-скрипту `analyze_mtDNA_repeats`.
+Здесь добавлены подробные русскоязычные комментарии, поясняющие каждую функцию и ключевые шаги.
+"""
 from typing import List, Dict
 import math
 import pandas as pd
@@ -10,6 +14,7 @@ from numpy.lib.stride_tricks import as_strided
 import logging
 import csv
 
+# Попытка импортировать numba — ускоритель JIT; если не установлен, работаем без него
 try:
     import numba
     NUMBA_AVAILABLE = True
@@ -19,90 +24,123 @@ except Exception:
 logger = logging.getLogger(__name__)
 
 
+# ===================== Основные вспомогательные функции =====================
+
 def get_motif_around_position(seq: str, pos: int, left_flank: int, right_flank: int) -> str:
-    # pos is 1-based to match R; convert to 0-based
+    """
+    Возвращает подстроку (motif) вокруг заданной позиции pos с учётом асимметричных фланков.
+    - seq: полная последовательность (строка), ожидается 1-based позиция pos (чтобы совпадало с R).
+    - left_flank/right_flank: сколько символов взять слева и справа от pos.
+
+    Возвращает строку, соответствующую мотиву.
+    """
+    # pos в R 1-based, поэтому для Python корректируем индексы в 0-based
     start = max(pos - left_flank - 1, 0)
     end = min(pos + right_flank - 1, len(seq) - 1)
+    # Возвращаем срез: в Python срезы end включительно, поэтому +1
     return seq[start:end + 1]
 
 
 def hamming_distance(a: str, b: str) -> int:
-    # assume equal length
+    """Возвращает число позиций, в которых строки a и b отличаются (предполагается одинаковая длина)."""
     return sum(ch1 != ch2 for ch1, ch2 in zip(a, b))
 
 
 def _seq_to_int_array(seq: str) -> np.ndarray:
-    """Map sequence string to small int array (A:0,C:1,G:2,T:3,others:4)."""
+    """Преобразует строку последовательности в компактный массив целых кодов.
+
+    Маппинг: A:0, C:1, G:2, T:3, остальные:4. Это ускоряет векторные операции в numpy.
+    """
     mp = {ord('A'): 0, ord('C'): 1, ord('G'): 2, ord('T'): 3, ord('a'):0, ord('c'):1, ord('g'):2, ord('t'):3}
+    # Преобразуем строку в байтовый массив
     arr = np.frombuffer(seq.encode('ascii', 'replace'), dtype=np.uint8)
-    # map bytes to our small ints
-    out = np.full(arr.shape, 4, dtype=np.uint8)
+    out = np.full(arr.shape, 4, dtype=np.uint8)  # по умолчанию 4 — 'прочие'
+    # Заменяем байтовые значения на наши компактные коды
     for k, v in mp.items():
         out[arr == k] = v
     return out
 
 
 def _sliding_window_view(arr: np.ndarray, k: int) -> np.ndarray:
-    """Return a 2D view (n-k+1, k) over 1D array using strides."""
+    """
+    Возвращает 2D 'view' (n-k+1, k) поверх 1D массива, используя трюки со сдвигами (strides).
+    Это даёт быстрый способ получить все окна длины k без выделения нового большого массива.
+    """
     n = arr.shape[0]
     if k > n:
         return np.empty((0, k), dtype=arr.dtype)
     shape = (n - k + 1, k)
+    # strides: шаг по памяти — одна позиция в исходном массиве
     strides = (arr.strides[0], arr.strides[0])
     return as_strided(arr, shape=shape, strides=strides)
 
 
-def find_approximate_repeats_np(seq: str, motif: str, max_mismatch: int) -> pd.DataFrame:
-    """NumPy-vectorized implementation of approximate repeats using sliding window and vector ops.
+# ===================== Поиск приблизительных повторов (NumPy) =====================
 
-    Returns same columns as the pure-Python implementation.
+def find_approximate_repeats_np(seq: str, motif: str, max_mismatch: int) -> pd.DataFrame:
+    """
+    NumPy-векторизованная реализация поиска повторов.
+    Идея: представить последовательность как числовой массив, получить "скользящие окна" (матрицу)
+    и посчитать для каждого окна число несовпадений с мотивом.
+
+    Возвращает DataFrame со столбцами: repeat.seq, repeat.start, repeat.end, repeat.hamming.distance
     """
     k = len(motif)
     n = len(seq)
     if k > n:
         return pd.DataFrame(columns=["repeat.seq", "repeat.start", "repeat.end", "repeat.hamming.distance"])
+
+    # Преобразуем последовательности в числовые массивы
     seq_arr = _seq_to_int_array(seq)
     motif_arr = _seq_to_int_array(motif)
+    # Получаем вид на все окна длины k
     windows = _sliding_window_view(seq_arr, k)
-    # compute mismatches per window
-    # boolean matrix where True indicates mismatch
+    # Булева матрица несовпадений: True там, где элементы различаются
     mismatches = windows != motif_arr
+    # Суммируем по строкам, чтобы получить расстояние Хэмминга для каждого окна
     distances = mismatches.sum(axis=1)
+    # Индексы окон, где число несовпадений <= max_mismatch
     matches_idx = np.nonzero(distances <= max_mismatch)[0]
+
     rows = []
     if matches_idx.size > 0:
-        # reconstruct strings for matched kmers
-        # to avoid creating all kmers, build from original string slicing
+        # Восстанавливаем строковое представление найденных k-mer только для совпадающих окон
         for i in matches_idx.tolist():
             rows.append({
                 "repeat.seq": seq[i:i + k],
-                "repeat.start": i + 1,
+                "repeat.start": i + 1,  # 1-based позиция старта
                 "repeat.end": i + k,
                 "repeat.hamming.distance": int(distances[i])
             })
     return pd.DataFrame(rows)
 
 
-def find_approximate_repeats(seq: str, motif: str, max_mismatch: int, use_numpy: bool = False, use_numba: bool = False) -> pd.DataFrame:
-    """Find all k-mers in seq that differ from motif by <= max_mismatch.
+# ===================== Гибридный поиск: NumPy или Python =====================
 
-    Parameters
-    - use_numpy: if True, use a NumPy-vectorized implementation (much faster for long sequences).
-    - use_numba: reserved for numba-based implementation (if available); currently unused when numba is not installed.
+def find_approximate_repeats(seq: str, motif: str, max_mismatch: int, use_numpy: bool = False, use_numba: bool = False) -> pd.DataFrame:
     """
+    Находит все подстроки длины k в seq, отличающиеся от motif не более чем на max_mismatch позиций.
+
+    Аргументы:
+    - use_numpy: если True, пытаемся применить быстрый NumPy-алгоритм.
+    - use_numba: зарезервировано для реализации с numba (если установлен).
+    """
+    # Попытка NumPy-ускоренного поиска
     if use_numpy:
         try:
             return find_approximate_repeats_np(seq, motif, max_mismatch)
         except Exception as e:
             logger.warning("NumPy accelerated search failed, falling back to Python implementation: %s", e)
-    # fallback pure-Python
+    # Если NumPy не использовать или он упал — используем чисто Python-реализацию
     k = len(motif)
     n = len(seq)
     if k > n:
         return pd.DataFrame(columns=["repeat.seq", "repeat.start", "repeat.end", "repeat.hamming.distance"])
+    # Генерируем все kmers (это может быть медленно для очень длинных последовательностей)
     kmers = [seq[i:i + k] for i in range(0, n - k + 1)]
     distances = [hamming_distance(motif, s) for s in kmers]
     matches = [i for i, d in enumerate(distances) if d <= max_mismatch]
+
     rows = []
     for i in matches:
         rows.append({
@@ -114,28 +152,31 @@ def find_approximate_repeats(seq: str, motif: str, max_mismatch: int, use_numpy:
     return pd.DataFrame(rows)
 
 
-def _process_task_worker(params):
-    """Top-level worker function for ProcessPoolExecutor. Receives a tuple of primitive args.
+# ===================== Вспомогательный рабочий процесс для параллелизации =====================
 
+def _process_task_worker(params):
+    """
+    Функция-воркер, которая вызывается в параллельных задачах (ProcessPoolExecutor).
+    Получает кортеж параметров и возвращает DataFrame с найденными повторами (или пустой DataFrame).
     params: (allele, seq_allele, motif_length, left_flank, right_flank, pos, ref_nuc, use_numpy, use_numba)
-    Returns a pandas DataFrame (possibly empty).
     """
     allele, seq_allele, motif_length, left_flank, right_flank, pos, ref_nuc, use_numpy, use_numba = params
 
-    # build motif around position using provided flanks
+    # Строим мотив вокруг позиции
     motif_seq = get_motif_around_position(seq_allele, pos, left_flank, right_flank)
     motif_string = motif_seq
     this_length = len(motif_string)
+    # Допустимое число несовпадений: floor(20% * длина)
     max_mismatch = math.floor(0.2 * this_length)
 
-    # find repeats (numpy or python implementation)
+    # Ищем повторы
     repeats_df = find_approximate_repeats(seq_allele, motif_seq, max_mismatch,
                                           use_numpy=use_numpy, use_numba=use_numba)
 
     if repeats_df.empty:
         return pd.DataFrame()
 
-    # annotate and normalize columns
+    # Добавляем колонки с метаданными (motif, аллель, позиция и т.д.)
     repeats_df = repeats_df.copy()
     repeats_df["motif.seq"] = motif_string
     repeats_df["motif.length"] = this_length
@@ -151,6 +192,8 @@ def _process_task_worker(params):
     return repeats_df[available]
 
 
+# ===================== Сборка таблицы повторов (Ref и Alt) =====================
+
 def get_repeatability_table(seq: str, pos: int, ref_nuc: str, alt_nuc: str,
                             max_flank_left: int = 20, max_flank_right: int = 20,
                             min_length: int = 5, max_length: int = 41,
@@ -158,23 +201,22 @@ def get_repeatability_table(seq: str, pos: int, ref_nuc: str, alt_nuc: str,
                             use_numba: bool = False,
                             use_parallel: bool = False,
                             n_workers: int | None = None) -> pd.DataFrame:
-    """Compute repeats for reference and alt alleles similar to the R routine.
+    """
+    Собирает DataFrame со всеми найденными повторами для референсной и альтернативной аллелей.
 
-    New options:
-    - use_numpy: use NumPy-vectorized k-mer/hamming implementation
-    - use_numba: use numba JIT (if available) for inner loops
-    - use_parallel: parallelize motif searches using ProcessPoolExecutor
+    Опции позволяют включить NumPy-ускорение и параллелизацию.
     """
     results = []
 
     def _allele_sequence(allele_char: str) -> str:
+        # Возвращает строку с последовательностью, где в позиции pos подставлен allele_char
         if allele_char == ref_nuc:
             return seq
         seq_list = list(seq)
         seq_list[pos - 1] = allele_char
         return "".join(seq_list)
 
-    # Build list of tasks so we can parallelize if requested
+    # Строим список задач (каждая задача — конкретная комбинация длины мотива и фланков)
     tasks = []
     for allele in (ref_nuc, alt_nuc):
         seq_allele = _allele_sequence(allele)
@@ -182,9 +224,9 @@ def get_repeatability_table(seq: str, pos: int, ref_nuc: str, alt_nuc: str,
             for left_flank in range(0, motif_length):
                 right_flank = motif_length - left_flank - 1
                 if left_flank <= max_flank_left and right_flank <= max_flank_right:
-                    # include parameters needed by top-level worker
                     tasks.append((allele, seq_allele, motif_length, left_flank, right_flank, pos, ref_nuc, use_numpy, (use_numba and NUMBA_AVAILABLE)))
 
+    # Если включена параллельная обработка — используем ProcessPoolExecutor
     if use_parallel:
         from concurrent.futures import ProcessPoolExecutor, as_completed
         results_dfs = []
@@ -199,16 +241,20 @@ def get_repeatability_table(seq: str, pos: int, ref_nuc: str, alt_nuc: str,
                     logger.exception("Task failed: %s", e)
         results = results_dfs
     else:
+        # Последовательное выполнение: просто вызываем воркер для каждой задачи
         for task in tasks:
             df = _process_task_worker(task)
             if not df.empty:
                 results.append(df)
 
+    # Если ничего не найдено — возвращаем пустую таблицу с ожидаемыми колонками
     if len(results) == 0:
         return pd.DataFrame(columns=["pos", "nuc", "RefAlt", "motif.seq", "motif.length", "motif.start", "motif.end",
                                      "repeat.seq", "repeat.start", "repeat.end", "repeat.hamming.distance"])
     return pd.concat(results, ignore_index=True)
 
+
+# ===================== Высокоуровневая функция analyze_mtDNA_repeats =====================
 
 def analyze_mtDNA_repeats(fasta_path: str,
                           pos: int,
@@ -225,7 +271,8 @@ def analyze_mtDNA_repeats(fasta_path: str,
                           major_arc_start: int = 5798,
                           major_arc_end: int = 16568,
                           output_path: str = None,
-                          output_prefix: str = "my_mtDNA_repeat") -> Dict[str, Path]:
+                          output_prefix: str = "my_mtDNA_repeat",
+                          debug: bool = False) -> Dict[str, Path]:
     """High-level pipeline mirroring the R `analyze_mtDNA_repeats` function.
 
     Reads fasta, finds repeats for Ref and Alt, filters self-overlaps and nested repeats,
@@ -249,6 +296,15 @@ def analyze_mtDNA_repeats(fasta_path: str,
                                      min_length=min_length, max_length=(max_flank_left + max_flank_right + 1),
                                      use_numpy=use_numpy, use_numba=use_numba, use_parallel=use_parallel, n_workers=n_workers)
 
+    # If requested, dump raw table for debugging
+    if debug and output_path is not None:
+        dbg_folder = Path(output_path) / "debug" / f"pos{pos}_{ref_nuc}to{alt_nuc}"
+        dbg_folder.mkdir(parents=True, exist_ok=True)
+        try:
+            table.to_csv(dbg_folder / f"{output_prefix}_raw_all_repeats.csv", index=False)
+        except Exception:
+            pass
+
     if table.empty:
         # prepare output folder even if empty
         folder = Path(output_path) if output_path else Path(".")
@@ -264,8 +320,24 @@ def analyze_mtDNA_repeats(fasta_path: str,
     filtered = filter_self_overlaps(table)
     filtered = compute_effective_length(filtered)
 
+    # debug dump filtered
+    if debug and output_path is not None:
+        try:
+            dbg_folder.mkdir(parents=True, exist_ok=True)
+            filtered.to_csv(dbg_folder / f"{output_prefix}_filtered_self_overlaps.csv", index=False)
+        except Exception:
+            pass
+
     # Remove nested repeats
     non_nested = remove_nested_repeats(filtered)
+
+    # debug dump non-nested
+    if debug and output_path is not None:
+        try:
+            dbg_folder.mkdir(parents=True, exist_ok=True)
+            non_nested.to_csv(dbg_folder / f"{output_prefix}_non_nested.csv", index=False)
+        except Exception:
+            pass
 
     # Prepare major-arc summary (top5 effective lengths) similar to R script
     maj = non_nested[(non_nested["repeat.start"] >= major_arc_start) & (non_nested["repeat.end"] <= major_arc_end)].copy()
@@ -357,7 +429,8 @@ def remove_nested_repeats(df: pd.DataFrame) -> pd.DataFrame:
     kept = []
     for allele in df["nuc"].unique():
         sub = df[df["nuc"] == allele].copy()
-        sub = sub.sort_values(by="EffectiveLength", ascending=False)
+        # use a stable sort so ties keep the original input order (to match R behavior)
+        sub = sub.sort_values(by="EffectiveLength", ascending=False, kind='mergesort')
         kept_intervals = []  # list of (start,end)
         for _, row in sub.iterrows():
             cs, ce = int(row["repeat.start"]), int(row["repeat.end"])
