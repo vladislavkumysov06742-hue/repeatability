@@ -14,13 +14,6 @@ ENV/
 data/
 data/**
 
-# Test artifacts
-.pytest_cache/
-.pytest_tmp/
-*.tmp/
-*.prof
-*.txt
-
 # OS files
 Thumbs.db
 .DS_Store

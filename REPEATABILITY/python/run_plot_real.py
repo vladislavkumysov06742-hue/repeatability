@@ -1,24 +1,29 @@
-#!/usr/bin/env python3
-"""Load a repeats CSV and plot it using the viz helper. Saves a PNG.
-"""
-from pathlib import Path
-import argparse
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+plt.show = lambda *a, **k: None
 import pandas as pd
-from src.viz import plot_circular_repeats
+from pathlib import Path
+from src import viz
 
+csv_path = Path('.').resolve() / '.pytest_tmp' / 'test_r_and_python_equivalence0' / 'pos8473_TtoC' / 'my_mtDNA_repeat_all_repeats.csv'
+print('Looking for CSV at', csv_path)
+if not csv_path.exists():
+    print('CSV not found:', csv_path)
+    raise SystemExit(1)
 
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument('csv', type=Path, help='Repeats CSV (mt_repeat_posXXX_all_repeats.csv)')
-    parser.add_argument('--out', type=Path, default=Path(__file__).resolve().parents[1] / 'viz_demo_out')
-    args = parser.parse_args()
+df = pd.read_csv(csv_path, dtype=str)
+# Ensure numeric columns
+for col in ['repeat.start','repeat.end','EffectiveLength','pos']:
+    if col in df.columns:
+        df[col] = pd.to_numeric(df[col], errors='coerce')
 
-    df = pd.read_csv(args.csv)
-    outdir = args.out
-    outdir.mkdir(parents=True, exist_ok=True)
-    plot_circular_repeats(df)
-    print(f'Plotted {args.csv} to screen (and ensured {outdir} exists)')
+print('Loaded repeats:', len(df))
+if df.empty:
+    print('No repeats to plot')
+    raise SystemExit(0)
 
-
-if __name__ == '__main__':
-    main()
+viz.plot_circular_repeats(df, radius=1.0, highlight_pos=int(df['pos'].iloc[0]))
+plt.savefig(Path('.').resolve() / 'viz_demo_out' / 'pos8473_real_repeats.png')
+plt.close()
+print('Saved viz to', Path('.').resolve() / 'viz_demo_out' / 'pos8473_real_repeats.png')

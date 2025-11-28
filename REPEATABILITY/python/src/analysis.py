@@ -157,7 +157,8 @@ def find_approximate_repeats(seq: str, motif: str, max_mismatch: int, use_numpy:
 def _process_task_worker(params):
     """
     Функция-воркер, которая вызывается в параллельных задачах (ProcessPoolExecutor).
-    Получает кортеж параметров и возвращает DataFrame с найденными повторами (или пустой DataFrame).
+    Получает кортеж параметров и возвращает СПИСОК СЛОВАРЕЙ с найденными повторами (не DataFrame).
+    Это избегает повторяющихся операций DataFrame.__setitem__ при батч-сборке результатов.
     params: (allele, seq_allele, motif_length, left_flank, right_flank, pos, ref_nuc, use_numpy, use_numba)
     """
     allele, seq_allele, motif_length, left_flank, right_flank, pos, ref_nuc, use_numpy, use_numba = params
@@ -174,22 +175,30 @@ def _process_task_worker(params):
                                           use_numpy=use_numpy, use_numba=use_numba)
 
     if repeats_df.empty:
-        return pd.DataFrame()
+        return []
 
-    # Добавляем колонки с метаданными (motif, аллель, позиция и т.д.)
-    repeats_df = repeats_df.copy()
-    repeats_df["motif.seq"] = motif_string
-    repeats_df["motif.length"] = this_length
-    repeats_df["motif.start"] = max(pos - left_flank, 1)
-    repeats_df["motif.end"] = min(pos + right_flank, len(seq_allele))
-    repeats_df["nuc"] = allele
-    repeats_df["pos"] = pos
-    repeats_df["RefAlt"] = "Ref" if allele == ref_nuc else "Alt"
-
-    cols = ["pos", "nuc", "RefAlt", "motif.seq", "motif.length", "motif.start", "motif.end",
-            "repeat.seq", "repeat.start", "repeat.end", "repeat.hamming.distance"]
-    available = [c for c in cols if c in repeats_df.columns]
-    return repeats_df[available]
+    # Вместо создания DataFrame с множественными __setitem__, возвращаем список словарей
+    # Это будет батч-собрано в конце в get_repeatability_table
+    motif_start = max(pos - left_flank, 1)
+    motif_end = min(pos + right_flank, len(seq_allele))
+    ref_alt = "Ref" if allele == ref_nuc else "Alt"
+    
+    rows = []
+    for idx, row in repeats_df.iterrows():
+        rows.append({
+            "pos": pos,
+            "nuc": allele,
+            "RefAlt": ref_alt,
+            "motif.seq": motif_string,
+            "motif.length": this_length,
+            "motif.start": motif_start,
+            "motif.end": motif_end,
+            "repeat.seq": row.get("repeat.seq", ""),
+            "repeat.start": row.get("repeat.start", 0),
+            "repeat.end": row.get("repeat.end", 0),
+            "repeat.hamming.distance": row.get("repeat.hamming.distance", 0)
+        })
+    return rows
 
 
 # ===================== Сборка таблицы повторов (Ref и Alt) =====================
@@ -200,7 +209,8 @@ def get_repeatability_table(seq: str, pos: int, ref_nuc: str, alt_nuc: str,
                             use_numpy: bool = False,
                             use_numba: bool = False,
                             use_parallel: bool = False,
-                            n_workers: int | None = None) -> pd.DataFrame:
+                            n_workers: int | None = None,
+                            compute_ref: bool = True) -> pd.DataFrame:
     """
     Собирает DataFrame со всеми найденными повторами для референсной и альтернативной аллелей.
 
@@ -218,7 +228,8 @@ def get_repeatability_table(seq: str, pos: int, ref_nuc: str, alt_nuc: str,
 
     # Строим список задач (каждая задача — конкретная комбинация длины мотива и фланков)
     tasks = []
-    for allele in (ref_nuc, alt_nuc):
+    allele_iter = ( (ref_nuc, alt_nuc) if compute_ref else (alt_nuc,) )
+    for allele in allele_iter:
         seq_allele = _allele_sequence(allele)
         for motif_length in range(min_length, max_length + 1):
             for left_flank in range(0, motif_length):
@@ -226,32 +237,35 @@ def get_repeatability_table(seq: str, pos: int, ref_nuc: str, alt_nuc: str,
                 if left_flank <= max_flank_left and right_flank <= max_flank_right:
                     tasks.append((allele, seq_allele, motif_length, left_flank, right_flank, pos, ref_nuc, use_numpy, (use_numba and NUMBA_AVAILABLE)))
 
+    # Собираем все результаты (списки словарей) в один плоский список
+    all_rows = []
+
     # Если включена параллельная обработка — используем ProcessPoolExecutor
     if use_parallel:
         from concurrent.futures import ProcessPoolExecutor, as_completed
-        results_dfs = []
         with ProcessPoolExecutor(max_workers=n_workers) as exe:
             futures = {exe.submit(_process_task_worker, task): task for task in tasks}
             for fut in as_completed(futures):
                 try:
-                    df = fut.result()
-                    if not df.empty:
-                        results_dfs.append(df)
+                    rows = fut.result()  # Теперь это список словарей, не DataFrame
+                    if rows:
+                        all_rows.extend(rows)
                 except Exception as e:
                     logger.exception("Task failed: %s", e)
-        results = results_dfs
     else:
         # Последовательное выполнение: просто вызываем воркер для каждой задачи
         for task in tasks:
-            df = _process_task_worker(task)
-            if not df.empty:
-                results.append(df)
+            rows = _process_task_worker(task)  # Теперь это список словарей, не DataFrame
+            if rows:
+                all_rows.extend(rows)
 
     # Если ничего не найдено — возвращаем пустую таблицу с ожидаемыми колонками
-    if len(results) == 0:
+    if len(all_rows) == 0:
         return pd.DataFrame(columns=["pos", "nuc", "RefAlt", "motif.seq", "motif.length", "motif.start", "motif.end",
                                      "repeat.seq", "repeat.start", "repeat.end", "repeat.hamming.distance"])
-    return pd.concat(results, ignore_index=True)
+    
+    # Батч-создаём DataFrame один раз из списка словарей (вместо конкатенации множества мелких DataFrames)
+    return pd.DataFrame(all_rows)
 
 
 # ===================== Высокоуровневая функция analyze_mtDNA_repeats =====================
@@ -260,6 +274,7 @@ def analyze_mtDNA_repeats(fasta_path: str,
                           pos: int,
                           ref_nuc: str,
                           alt_nuc: str,
+                          compute_ref: bool = True,
                           max_flank_left: int = 20,
                           max_flank_right: int = 20,
                           min_length: int = 5,
@@ -272,15 +287,25 @@ def analyze_mtDNA_repeats(fasta_path: str,
                           major_arc_end: int = 16568,
                           output_path: str = None,
                           output_prefix: str = "my_mtDNA_repeat",
-                          debug: bool = False) -> Dict[str, Path]:
+                          debug: bool = False,
+                          cache_dir: str | None = None,
+                          seq: str | None = None) -> Dict[str, Path]:
     """High-level pipeline mirroring the R `analyze_mtDNA_repeats` function.
 
     Reads fasta, finds repeats for Ref and Alt, filters self-overlaps and nested repeats,
     computes EffectiveLength, writes two CSVs into output folder and returns paths.
+    
+    Args:
+        fasta_path: Path to FASTA file (used only if seq is None)
+        seq: Pre-loaded sequence string. If provided, skips reading from fasta_path.
+             This is an optimization to avoid re-reading the same FASTA multiple times.
     """
-    # Read sequence
-    rec = SeqIO.read(str(fasta_path), "fasta")
-    seq = str(rec.seq)
+    # Read sequence (or use pre-loaded)
+    if seq is None:
+        rec = SeqIO.read(str(fasta_path), "fasta")
+        seq = str(rec.seq)
+    else:
+        seq = str(seq)  # Ensure it's a string
 
     # Ensure that the nucleotide at `pos` equals the provided reference allele (match R behavior)
     if pos < 1 or pos > len(seq):
@@ -290,52 +315,134 @@ def analyze_mtDNA_repeats(fasta_path: str,
         seq_list[pos - 1] = ref_nuc
         seq = "".join(seq_list)
 
-    # Compute raw repeats table
-    table = get_repeatability_table(seq, pos, ref_nuc, alt_nuc,
-                                     max_flank_left=max_flank_left, max_flank_right=max_flank_right,
-                                     min_length=min_length, max_length=(max_flank_left + max_flank_right + 1),
-                                     use_numpy=use_numpy, use_numba=use_numba, use_parallel=use_parallel, n_workers=n_workers)
+    # Prepare cache path (if requested). Default cache is inside output_path/cache
+    cache_path = None
+    if cache_dir:
+        cache_path = Path(cache_dir)
+    elif output_path:
+        cache_path = Path(output_path) / 'cache'
+    if cache_path:
+        cache_path.mkdir(parents=True, exist_ok=True)
+    cache_file = cache_path / f"pos{pos}_ref_non_nested.parquet" if cache_path else None
 
-    # If requested, dump raw table for debugging
-    if debug and output_path is not None:
-        dbg_folder = Path(output_path) / "debug" / f"pos{pos}_{ref_nuc}to{alt_nuc}"
-        dbg_folder.mkdir(parents=True, exist_ok=True)
-        try:
-            table.to_csv(dbg_folder / f"{output_prefix}_raw_all_repeats.csv", index=False)
-        except Exception:
-            pass
+    # If compute_ref is False, compute only Alt and try to load cached Ref non-nested table
+    if not compute_ref:
+        # compute alt-only table
+        table_alt = get_repeatability_table(seq, pos, ref_nuc, alt_nuc,
+                                           max_flank_left=max_flank_left, max_flank_right=max_flank_right,
+                                           min_length=min_length, max_length=(max_flank_left + max_flank_right + 1),
+                                           use_numpy=use_numpy, use_numba=use_numba, use_parallel=use_parallel, n_workers=n_workers,
+                                           compute_ref=False)
 
-    if table.empty:
-        # prepare output folder even if empty
-        folder = Path(output_path) if output_path else Path(".")
-        folder = folder / f"pos{pos}_{ref_nuc}to{alt_nuc}"
-        folder.mkdir(parents=True, exist_ok=True)
-        all_out = folder / f"{output_prefix}_all_repeats.csv"
-        summary_out = folder / f"{output_prefix}_major_arc_summary_top5.csv"
-        pd.DataFrame().to_csv(all_out, index=False)
-        pd.DataFrame().to_csv(summary_out, index=False)
-        return {"all_repeats": all_out, "summary_top5_major_arc": summary_out, "output_folder": folder}
+        if table_alt.empty:
+            # prepare output folder even if empty
+            folder = Path(output_path) if output_path else Path(".")
+            folder = folder / f"pos{pos}_{ref_nuc}to{alt_nuc}"
+            folder.mkdir(parents=True, exist_ok=True)
+            all_out = folder / f"{output_prefix}_all_repeats.csv"
+            summary_out = folder / f"{output_prefix}_major_arc_summary_top5.csv"
+            pd.DataFrame().to_csv(all_out, index=False)
+            pd.DataFrame().to_csv(summary_out, index=False)
+            return {"all_repeats": all_out, "summary_top5_major_arc": summary_out, "output_folder": folder}
 
-    # Filter self overlaps and compute EffectiveLength
-    filtered = filter_self_overlaps(table)
-    filtered = compute_effective_length(filtered)
+        filtered_alt = filter_self_overlaps(table_alt)
+        filtered_alt = compute_effective_length(filtered_alt)
+        non_nested_alt = remove_nested_repeats(filtered_alt)
 
-    # debug dump filtered
-    if debug and output_path is not None:
-        try:
+        # Attempt to load cached ref non-nested from parquet
+        ref_non_nested = None
+        if cache_file and cache_file.exists():
+            try:
+                ref_non_nested = pd.read_parquet(cache_file)
+            except Exception:
+                ref_non_nested = None
+
+        if ref_non_nested is None:
+            # Fallback: compute ref now and cache it
+            table_ref = get_repeatability_table(seq, pos, ref_nuc, alt_nuc,
+                                               max_flank_left=max_flank_left, max_flank_right=max_flank_right,
+                                               min_length=min_length, max_length=(max_flank_left + max_flank_right + 1),
+                                               use_numpy=use_numpy, use_numba=use_numba, use_parallel=use_parallel, n_workers=n_workers,
+                                               compute_ref=True)
+            if table_ref.empty:
+                ref_non_nested = pd.DataFrame()
+            else:
+                filtered_ref = filter_self_overlaps(table_ref)
+                filtered_ref = compute_effective_length(filtered_ref)
+                ref_non_nested = remove_nested_repeats(filtered_ref)
+                if cache_file:
+                    try:
+                        ref_non_nested.to_parquet(cache_file, compression='snappy', index=False)
+                    except Exception:
+                        pass
+
+        # Combine ref and alt non-nested
+        if ref_non_nested is None:
+            non_nested = non_nested_alt
+        else:
+            non_nested = pd.concat([ref_non_nested, non_nested_alt], ignore_index=True)
+
+        # continue to prepare outputs below using `non_nested`
+
+    else:
+        # compute ref+alt (or ref if alt equals ref) and cache ref non-nested for reuse
+        table = get_repeatability_table(seq, pos, ref_nuc, alt_nuc,
+                                        max_flank_left=max_flank_left, max_flank_right=max_flank_right,
+                                        min_length=min_length, max_length=(max_flank_left + max_flank_right + 1),
+                                        use_numpy=use_numpy, use_numba=use_numba, use_parallel=use_parallel, n_workers=n_workers,
+                                        compute_ref=True)
+
+        # If requested, dump raw table for debugging
+        if debug and output_path is not None:
+            dbg_folder = Path(output_path) / "debug" / f"pos{pos}_{ref_nuc}to{alt_nuc}"
             dbg_folder.mkdir(parents=True, exist_ok=True)
-            filtered.to_csv(dbg_folder / f"{output_prefix}_filtered_self_overlaps.csv", index=False)
-        except Exception:
-            pass
+            try:
+                table.to_csv(dbg_folder / f"{output_prefix}_raw_all_repeats.csv", index=False)
+            except Exception:
+                pass
 
-    # Remove nested repeats
-    non_nested = remove_nested_repeats(filtered)
+        if table.empty:
+            # prepare output folder even if empty
+            folder = Path(output_path) if output_path else Path(".")
+            folder = folder / f"pos{pos}_{ref_nuc}to{alt_nuc}"
+            folder.mkdir(parents=True, exist_ok=True)
+            all_out = folder / f"{output_prefix}_all_repeats.csv"
+            summary_out = folder / f"{output_prefix}_major_arc_summary_top5.csv"
+            pd.DataFrame().to_csv(all_out, index=False)
+            pd.DataFrame().to_csv(summary_out, index=False)
+            return {"all_repeats": all_out, "summary_top5_major_arc": summary_out, "output_folder": folder}
 
-    # debug dump non-nested
-    if debug and output_path is not None:
+        # Filter self overlaps and compute EffectiveLength
+        filtered = filter_self_overlaps(table)
+        filtered = compute_effective_length(filtered)
+
+        # debug dump filtered
+        if debug and output_path is not None:
+            try:
+                dbg_folder.mkdir(parents=True, exist_ok=True)
+                filtered.to_csv(dbg_folder / f"{output_prefix}_filtered_self_overlaps.csv", index=False)
+            except Exception:
+                pass
+
+        # Remove nested repeats
+        non_nested = remove_nested_repeats(filtered)
+
+        # debug dump non-nested
+        if debug and output_path is not None:
+            try:
+                dbg_folder.mkdir(parents=True, exist_ok=True)
+                non_nested.to_csv(dbg_folder / f"{output_prefix}_non_nested.csv", index=False)
+            except Exception:
+                pass
+
+        # Cache ref non-nested separately for reuse (parquet format for better I/O)
         try:
-            dbg_folder.mkdir(parents=True, exist_ok=True)
-            non_nested.to_csv(dbg_folder / f"{output_prefix}_non_nested.csv", index=False)
+            ref_non_nested_cache = non_nested[non_nested.get('RefAlt') == 'Ref'] if 'RefAlt' in non_nested.columns else pd.DataFrame()
+            if cache_file and not ref_non_nested_cache.empty:
+                try:
+                    ref_non_nested_cache.to_parquet(cache_file, compression='snappy', index=False)
+                except Exception:
+                    pass
         except Exception:
             pass
 

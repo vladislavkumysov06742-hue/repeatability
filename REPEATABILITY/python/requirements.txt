@@ -3,3 +3,5 @@ biopython
 numpy
 pytest
 numba
+matplotlib
+pyarrow

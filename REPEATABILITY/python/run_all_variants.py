@@ -1,8 +1,13 @@
 #!/usr/bin/env python3
 """Run analyze_mtDNA_repeats for every position and all alternative alleles.
 
-This is the runner we used interactively. It supports --use-numpy, --precompute-ref-only
-and --max-workers to control parallelism.
+Usage examples:
+  python run_all_variants.py --start 1 --end 100 --skip-existing
+  python run_all_variants.py --dry-run --start 8000 --end 9000
+
+The script calls `analyze_mtDNA_repeats(fasta, pos, ref, alt, output_path, output_prefix)`
+from `src.analysis`. It will create output subfolders under `--outdir` named
+`pos{pos}_{ref}to{alt}` unless `--skip-existing` is set and the folder already exists.
 """
 from pathlib import Path
 import argparse
@@ -83,7 +88,6 @@ def main():
         return
 
     total = [0]
-
     def process_position(pos):
         ref = seq[pos - 1].upper()
         if ref not in {'A', 'C', 'G', 'T'}:
