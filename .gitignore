@@ -1,0 +1,7 @@
+# Ignore everything except REPEATABILITY and specific documentation
+/*
+!.gitignore
+!.git/
+!/REPEATABILITY/
+!/TODO.md
+!/DETAILED*.md

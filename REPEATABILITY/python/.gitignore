@@ -14,10 +14,12 @@ ENV/
 data/
 data/**
 
-# Pytest
+# Test artifacts
 .pytest_cache/
 .pytest_tmp/
 *.tmp/
+*.prof
+*.txt
 
 # OS files
 Thumbs.db
