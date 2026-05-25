@@ -1,75 +1,50 @@
-# Игнорировать всё по умолчанию
-*
+cat > .gitignore << 'EOF'
+# Большие папки с данными (не для Git)
+all/01KP/
+all/cleaned/
 
-# Не игнорировать служебные файлы и нужные папки
-!.gitignore
-!01D.KP.Preliminary_Analysis.ipynb
-!analysis.ipynb
-!analysis_1.ipynb
-!prepare.ipynb
-!scatter_plot.ipynb
-!requirements.txt
-!README.md
-!run_all_variants.py
-!run_mtDNA_repeats.slurm
-!run_mtDNA_repeats_slurm.sh
+# Мусор в output (но stats оставляем)
+output/D:repeatabilityplots/
 
-# Разрешить сами папки (чтобы могли попасть .gitkeep и нужные файлы)
-!figures/
-!logs/
-!data/
-!functions/
-!notebooks/
-!data/1_raw/
-!data/2_derived/
-
-# Внутри figures: разрешить только .png и .gitkeep
-figures/*
-!figures/*.png
-!figures/.gitkeep
-
-# Внутри logs: разрешить только .gitkeep
-logs/*
-!logs/.gitkeep
-
-# Внутри data/2_derived: разрешить только .gitkeep
-data/2_derived/*
-!data/2_derived/.gitkeep
-
-# Внутри functions: разрешить все .py и .gitkeep
-functions/*
-!functions/*.py
-!functions/.gitkeep
-
-# Внутри notebooks: разрешить все .ipynb и .gitkeep
-notebooks/*
-!notebooks/*.ipynb
-!notebooks/.gitkeep
-
-# Внутри data/1_raw: разрешить всё (так как папка должна быть полностью)
-data/1_raw/*
-
-# Остальные системные и временные файлы – игнорировать
+# Виртуальные окружения и кэш
 venv/
 __pycache__/
 *.pyc
 *.pyo
-*.so
-*.dll
-*.dylib
+
+# Логи, временные отчёты, SLURM-логи
+slurm_logs/
+text_reports/
+*.log
+*.out
+*.dump
+*.data
+
+# Архивы
+*.tar.gz
+*.tgz
+*.zip
+*.7z
+
+# Системные временные файлы
 .DS_Store
 *.swp
 *.tmp
 *.bak
 *.orig
-*.log
-*.out
-*.dump
-*.data
-*.tar.gz
-*.tgz
-*.zip
-*.7z
+
+# Прочее
 tree.txt
-text_reports/
-slurm_logs/
+EOF
+
+# Исключаем виртуальную среду cleaning-env (она огромная)
+output/cleaning-env/
+
+# Дополнительно, если вдруг что-то ещё из мусора попало
+*.pyc
+__pycache__/
+.DS_Store
+*.log
+*.tmp
+*.bak
+*.orig
