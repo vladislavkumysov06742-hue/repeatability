@@ -1,7 +1,7 @@
 # Игнорировать всё по умолчанию
 *
 
-# НО не игнорировать перечисленные файлы в корне
+# Не игнорировать служебные файлы и нужные папки
 !.gitignore
 !01D.KP.Preliminary_Analysis.ipynb
 !analysis.ipynb
@@ -14,31 +14,42 @@
 !run_mtDNA_repeats.slurm
 !run_mtDNA_repeats_slurm.sh
 
-# Не игнорировать сами папки (чтобы они появились в репозитории)
+# Разрешить сами папки (чтобы могли попасть .gitkeep и нужные файлы)
 !figures/
 !logs/
 !data/
 !functions/
 !notebooks/
+!data/1_raw/
+!data/2_derived/
 
-# Игнорировать содержимое figures, но сохранить пустую папку через .gitkeep
+# Внутри figures: разрешить только .png и .gitkeep
 figures/*
+!figures/*.png
 !figures/.gitkeep
 
-# Игнорировать содержимое logs, но сохранить пустую папку
+# Внутри logs: разрешить только .gitkeep
 logs/*
 !logs/.gitkeep
 
-# Для data: игнорировать всё внутри, кроме data/1_raw
-data/*
-!data/1_raw/
-# Разрешить всё, что внутри data/1_raw (включая подпапки и файлы)
-!data/1_raw/**
-# Игнорировать содержимое data/2_derived, но сохранить саму папку
+# Внутри data/2_derived: разрешить только .gitkeep
 data/2_derived/*
 !data/2_derived/.gitkeep
 
-# Дополнительно игнорировать системные и временные файлы (на всякий случай)
+# Внутри functions: разрешить все .py и .gitkeep
+functions/*
+!functions/*.py
+!functions/.gitkeep
+
+# Внутри notebooks: разрешить все .ipynb и .gitkeep
+notebooks/*
+!notebooks/*.ipynb
+!notebooks/.gitkeep
+
+# Внутри data/1_raw: разрешить всё (так как папка должна быть полностью)
+data/1_raw/*
+
+# Остальные системные и временные файлы – игнорировать
 venv/
 __pycache__/
 *.pyc
