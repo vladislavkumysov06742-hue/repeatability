@@ -1,0 +1,64 @@
+# Игнорировать всё по умолчанию
+*
+
+# НО не игнорировать перечисленные файлы в корне
+!.gitignore
+!01D.KP.Preliminary_Analysis.ipynb
+!analysis.ipynb
+!analysis_1.ipynb
+!prepare.ipynb
+!scatter_plot.ipynb
+!requirements.txt
+!README.md
+!run_all_variants.py
+!run_mtDNA_repeats.slurm
+!run_mtDNA_repeats_slurm.sh
+
+# Не игнорировать сами папки (чтобы они появились в репозитории)
+!figures/
+!logs/
+!data/
+!functions/
+!notebooks/
+
+# Игнорировать содержимое figures, но сохранить пустую папку через .gitkeep
+figures/*
+!figures/.gitkeep
+
+# Игнорировать содержимое logs, но сохранить пустую папку
+logs/*
+!logs/.gitkeep
+
+# Для data: игнорировать всё внутри, кроме data/1_raw
+data/*
+!data/1_raw/
+# Разрешить всё, что внутри data/1_raw (включая подпапки и файлы)
+!data/1_raw/**
+# Игнорировать содержимое data/2_derived, но сохранить саму папку
+data/2_derived/*
+!data/2_derived/.gitkeep
+
+# Дополнительно игнорировать системные и временные файлы (на всякий случай)
+venv/
+__pycache__/
+*.pyc
+*.pyo
+*.so
+*.dll
+*.dylib
+.DS_Store
+*.swp
+*.tmp
+*.bak
+*.orig
+*.log
+*.out
+*.dump
+*.data
+*.tar.gz
+*.tgz
+*.zip
+*.7z
+tree.txt
+text_reports/
+slurm_logs/
