@@ -1,34 +1,31 @@
-
 #!/usr/bin/env python3
 """
 Полный пайплайн анализа повторяемости мтДНК.
-Режимы: clean, plot, stats.
+Режимы: clean, plot, stats, all.
 """
 
-import argparse, subprocess, tempfile, heapq, os, shutil, platform, sys
+import argparse, subprocess, tempfile, heapq, os, shutil, platform, sys, csv
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 from collections import defaultdict
 import matplotlib.pyplot as plt
 import numpy as np
 from scipy import stats
-from scipy.stats import gaussian_kde, nbinom, poisson, norm
+from scipy.stats import gaussian_kde, norm, mannwhitneyu
 import warnings
 warnings.filterwarnings('ignore')
 
-# Проверка statsmodels
+# Попытка импорта statsmodels (для FDR в окнах)
 try:
-    from statsmodels.discrete.count_model import ZeroInflatedNegativeBinomialP
-    from statsmodels.tools import add_constant
+    from statsmodels.stats.multitest import multipletests
     STATSMODELS_AVAILABLE = True
 except ImportError:
     STATSMODELS_AVAILABLE = False
-    print("statsmodels не найден. Установите 'pip install statsmodels' для ZINB.")
+    print("statsmodels не установлен. Оконный анализ может не работать. Установите: pip install statsmodels")
 
 # ============================================================
-#  КОНФИГУРАЦИЯ
+#  ГЛОБАЛЬНЫЕ КОНСТАНТЫ
 # ============================================================
-MT_LEN = 16569
 MAJOR_ARC_START = 5747
 MAJOR_ARC_END = 407
 
@@ -37,7 +34,6 @@ PHENOTYPE = {
     "12705": -1, "14798": -1, "16223": 1,
 }
 SNP_NAMES = ["8251", "8472", "8473", "12705", "14798", "16223"]
-
 REF_SUFFIX = {"8251": "G", "8472": "C", "8473": "T", "12705": "C", "14798": "T", "16223": "C"}
 ALT_SUFFIX = {"8251": "A", "8472": "T", "8473": "C", "12705": "T", "14798": "C", "16223": "T"}
 
@@ -46,7 +42,6 @@ COLOR_NEG_BAR = "#ffb3b3"
 COLOR_PHEN_POS = "#89CFF0"
 COLOR_PHEN_NEG = "#FADADD"
 
-# Глобальная проверка sort
 if platform.system() == 'Windows':
     HAS_SYSTEM_SORT = False
 else:
@@ -55,8 +50,10 @@ else:
 # ============================================================
 #  ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
 # ============================================================
-def norm_interval(start, end):
-    return (start, end) if start <= end else (start, end + MT_LEN)
+def norm_interval(start, end, MT_LEN):
+    if start <= end:
+        return start, end
+    return start, end + MT_LEN
 
 def check_contained(m_s1, m_e1, r_s1, r_e1, m_s2, m_e2, r_s2, r_e2):
     return (m_s1 <= m_s2 and m_e2 <= m_e1 and r_s1 <= r_s2 and r_e2 <= r_e1)
@@ -159,9 +156,20 @@ def h_bonds(seq):
     return sum(bonds.get(b, 0) for b in seq.upper())
 
 # ============================================================
+#  ЗАГРУЗКА РЕФЕРЕНСА
+# ============================================================
+def read_reference(path):
+    seq = []
+    with open(path) as f:
+        for line in f:
+            if line.startswith('>'): continue
+            seq.append(line.strip().upper())
+    return ''.join(seq)
+
+# ============================================================
 #  CLEAN
 # ============================================================
-def clean_file(file_path, output_dir):
+def clean_file(file_path, output_dir, MT_LEN):
     print(f"   Обработка {file_path.name} ...")
     lines = file_path.read_text().splitlines()
     if len(lines) < 2: return
@@ -181,9 +189,12 @@ def clean_file(file_path, output_dir):
         output_dir.mkdir(parents=True, exist_ok=True)
         (output_dir / file_path.name).write_text(header + '\tmotif_GC\trepeat_GC\tmotif_H_bonds\trepeat_H_bonds\n')
         return
-    records = [(norm_interval(int(p[4]),int(p[5]))[0], norm_interval(int(p[4]),int(p[5]))[1],
-                norm_interval(int(p[7]),int(p[8]))[0], norm_interval(int(p[7]),int(p[8]))[1], l)
-               for l in valid for p in [l.split('\t')]]
+    records = []
+    for l in valid:
+        p = l.split('\t')
+        m_s, m_e = norm_interval(int(p[4]), int(p[5]), MT_LEN)
+        r_s, r_e = norm_interval(int(p[7]), int(p[8]), MT_LEN)
+        records.append((m_s, m_e, r_s, r_e, l))
     cids = cluster_by_repeat_overlap(records)
     tmp_in = tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.presort')
     for cid, (ms, me, rs, re, line) in zip(cids, records):
@@ -218,18 +229,22 @@ def clean_file(file_path, output_dir):
     print(f"   Готово: {out} (оставлено {len(kept)} повторов)")
 
 # ============================================================
-#  PLOT
+#  PLOT (без изменений)
 # ============================================================
-def interval_in_major_arc(start, end):
+def interval_in_major_arc(start, end, MT_LEN):
     if start <= end:
-        if start >= MAJOR_ARC_START: return end <= MT_LEN
-        elif end <= MAJOR_ARC_END: return start >= 1
-        return False
-    in_upper = start >= MAJOR_ARC_START and start <= MT_LEN
-    in_lower = end >= 1 and end <= MAJOR_ARC_END
-    return in_upper and in_lower
+        if start >= MAJOR_ARC_START:
+            return end <= MT_LEN
+        elif end <= MAJOR_ARC_END:
+            return start >= 1
+        else:
+            return False
+    else:
+        in_upper = (start >= MAJOR_ARC_START) and (start <= MT_LEN)
+        in_lower = (end >= 1) and (end <= MAJOR_ARC_END)
+        return in_upper and in_lower
 
-def get_max_perfect_repeat_details(file_path):
+def get_max_perfect_repeat_details(file_path, MT_LEN):
     max_len = 0; best_seq = ""; best_start = 0; best_end = 0
     with file_path.open() as f:
         f.readline()
@@ -239,7 +254,7 @@ def get_max_perfect_repeat_details(file_path):
             if len(p) < 10: continue
             try: hamming = int(p[9]); rstart = int(p[7]); rend = int(p[8])
             except: continue
-            if hamming == 0 and interval_in_major_arc(rstart, rend):
+            if hamming == 0 and interval_in_major_arc(rstart, rend, MT_LEN):
                 seq_len = len(p[6])
                 if seq_len > max_len:
                     max_len = seq_len; best_seq = p[6]; best_start = rstart; best_end = rend
@@ -273,7 +288,7 @@ def plot_forest(delta_values, snp_names, phenotype, output_dir):
     fig.tight_layout()
     fig.savefig(output_dir / 'forest_plot_deltaR.png', dpi=150); plt.close()
 
-def run_plot(input_dir, output_dir):
+def run_plot(input_dir, output_dir, MT_LEN):
     print(f"Режим plot: {input_dir}")
     delta_values, details, missing = {}, {}, []
     for snp in SNP_NAMES:
@@ -282,8 +297,8 @@ def run_plot(input_dir, output_dir):
         if not ref_path.exists(): missing.append(str(ref_path))
         elif not alt_path.exists(): missing.append(str(alt_path))
         else:
-            rlen, rseq, rs, re = get_max_perfect_repeat_details(ref_path)
-            alen, aseq, as_, ae = get_max_perfect_repeat_details(alt_path)
+            rlen, rseq, rs, re = get_max_perfect_repeat_details(ref_path, MT_LEN)
+            alen, aseq, as_, ae = get_max_perfect_repeat_details(alt_path, MT_LEN)
             delta = alen - rlen
             delta_values[snp] = delta
             details[snp] = {'ref':(rlen, rseq, rs, re), 'alt':(alen, aseq, as_, ae)}
@@ -302,17 +317,9 @@ def run_plot(input_dir, output_dir):
     plot_forest(delta_values, SNP_NAMES, PHENOTYPE, output_dir)
 
 # ============================================================
-#  STATS (с логированием и стабильным ZINB)
+#  STATS (MAD Z-score + все графики + окна)
 # ============================================================
-def read_reference(path):
-    seq = []
-    with open(path) as f:
-        for line in f:
-            if line.startswith('>'): continue
-            seq.append(line.strip().upper())
-    return ''.join(seq)
-
-def load_cleaned_files(input_dir, reference_seq, log_print):
+def load_cleaned_files(input_dir, reference_seq, log_print, MT_LEN):
     per_pos = defaultdict(dict)
     all_repeats_raw, all_repeats_weighted = [], []
     ref_nuc = {}
@@ -368,99 +375,151 @@ def load_cleaned_files(input_dir, reference_seq, log_print):
     log_print(f"Всего повторов (raw): {len(all_repeats_raw)}")
     return per_pos, ref_nuc, all_repeats_raw, all_repeats_weighted, metrics
 
-def fit_zinb(background, log_print=None):
-    """Обучает ZINB с ограничением итераций (maxiter=100)."""
-    if not STATSMODELS_AVAILABLE:
-        return None
-    try:
-        bg = np.array(background, dtype=int)
-        X = add_constant(np.ones_like(bg))
-        model = ZeroInflatedNegativeBinomialP(bg, X, offset=None, p=2)
-        result = model.fit(disp=0, maxiter=100)   # <-- ключевое ограничение
-        if log_print:
-            log_print(f" ZINB сошлась за {result.iterations} итераций.")
-        return result
-    except Exception as e:
-        if log_print:
-            log_print(f" ZINB не удалась: {e}. Переключаюсь на NB/Poisson.")
-        return None
+def mad_zscore_pvalue(observed, background):
+    """Робастный MAD Z-score с двусторонним p-value."""
+    if len(background) < 5:
+        return 1.0, {'test': 'MAD-Z', 'params': 'N<5'}
+    bg = np.array(background, dtype=float)
+    med = np.median(bg)
+    mad = np.median(np.abs(bg - med))
+    if mad == 0:
+        # если MAD=0, используем обычный z-score
+        std = np.std(bg)
+        if std == 0:
+            return 1.0 if observed == med else 0.0, {'test': 'Z-score', 'params': f'std={std:.3f}'}
+        z = (observed - med) / std
+        pval = 2 * norm.sf(abs(z))
+        return pval, {'test': 'Z-score', 'params': f'std={std:.3f}'}
+    # Модифицированный Z-score (Iglewicz & Hoaglin)
+    z = 0.6745 * (observed - med) / mad
+    pval = 2 * norm.sf(abs(z))
+    return pval, {'test': 'MAD-Z', 'params': f'med={med:.2f}, MAD={mad:.2f}'}
 
-def zinb_pvalue(observed, zinb_result, background):
-    """Если ZINB=None, использует быстрый NB/Poisson."""
-    if zinb_result is None:
-        bg = np.array(background, dtype=float)
-        mu = np.mean(bg)
-        var = np.var(bg)
-        if var > mu + 1:
-            p_param = mu / var if var > 0 else 0.99
-            r_param = mu * p_param / (1 - p_param) if p_param < 1 else 100
-            if observed <= mu:
-                left = nbinom.cdf(observed, r_param, p_param)
-                right_obs = int(2*mu - observed)
-                right = nbinom.sf(right_obs-1, r_param, p_param) if right_obs>=0 else 1.0
-                pval = left + right
-            else:
-                right = nbinom.sf(observed-1, r_param, p_param)
-                left_obs = int(2*mu - observed)
-                left = nbinom.cdf(left_obs, r_param, p_param) if left_obs>=0 else 0.0
-                pval = left + right
-            pval = max(min(pval, 1.0), 0.0)
-            return pval, {'test': 'NB (fallback)', 'params': f'r={r_param:.2f}, p={p_param:.3f}'}
-        else:
-            if mu < 0.1: mu = 0.1
-            if observed <= mu:
-                left = poisson.cdf(observed, mu)
-                right_obs = int(2*mu - observed)
-                right = poisson.sf(right_obs-1, mu) if right_obs>=0 else 1.0
-                pval = left + right
-            else:
-                right = poisson.sf(observed-1, mu)
-                left_obs = int(2*mu - observed)
-                left = poisson.cdf(left_obs, mu) if left_obs>=0 else 0.0
-                pval = left + right
-            pval = max(min(pval, 1.0), 0.0)
-            return pval, {'test': 'Poisson (fallback)', 'params': f'mu={mu:.3f}'}
-    # ZINB обучена – используем fallback (т.к. cdf не извлекается)
-    return zinb_pvalue(observed, None, background)
-
-def parametric_pvalue(observed, background, metric, log_print=None):
-    if len(background) < 10:
-        return 1.0, {'test': 'None', 'params': 'too few points'}
-    if STATSMODELS_AVAILABLE:
-        zinb_res = fit_zinb(background, log_print)
-        if zinb_res is not None:
-            pval, info = zinb_pvalue(observed, zinb_res, background)
-            info['test'] = 'ZINB'
-            info['params'] = 'ZINB fitted'
-            return pval, info
-    pval, info = zinb_pvalue(observed, None, background)
-    return pval, info
-
-def add_significance_lines(ax, pvals, log_print=None):
+def add_significance_lines(ax, pvals, log_print=None, test_name=''):
     n = len(pvals)
     ax.axhline(-np.log10(0.05), color='gray', linestyle='--', alpha=0.5, label='Nominal α=0.05')
-    sorted_p = np.sort(pvals)
-    sig = None
-    for i, p in enumerate(sorted_p):
-        if p <= (i+1)/n*0.05:
-            sig = p
-    if sig is not None:
-        ax.axhline(-np.log10(sig), color='red', linestyle='--', alpha=0.5, label='FDR threshold')
-        if log_print: log_print(f"   FDR порог: p≤{sig:.2e} (-log10={-np.log10(sig):.2f})")
-    else:
-        if log_print: log_print("   FDR: значимых точек нет")
-    ax.legend()
+    if n > 0 and STATSMODELS_AVAILABLE:
+        _, qvals, _, _ = multipletests(pvals, method='fdr_bh')
+        sig = np.min(np.array(pvals)[qvals < 0.05]) if np.any(qvals < 0.05) else None
+        if sig is not None:
+            ax.axhline(-np.log10(sig), color='red', linestyle='--', alpha=0.5, label='FDR threshold')
+            if log_print: log_print(f"   FDR порог: p≤{sig:.2e}")
+        else:
+            if log_print: log_print("   FDR: значимых точек нет")
+    ax.legend(title=test_name)
 
-def compute_coverage(all_repeats, weighted=False):
-    cov = np.zeros(MT_LEN+1, dtype=float)
-    for item in all_repeats:
-        if weighted: s, e, w = item
-        else: s, e = item; w = 1
-        if e > MT_LEN: e = MT_LEN
-        cov[s:e+1] += w
+def windowed_analysis(per_pos, ref_nuc, metrics, metric_name, MT_LEN, window_size=200, step_size=100, n_perm=1000, log_print=None):
+    positions_all = sorted(per_pos.keys())
+    n_pos = len(positions_all)
+    ref_vals = np.zeros(n_pos)
+    for i, pos in enumerate(positions_all):
+        ref = ref_nuc.get(pos)
+        if ref and ref in per_pos[pos]:
+            ref_vals[i] = metrics[pos][ref].get(metric_name, 0)
+    windows = []
+    for start in range(1, MT_LEN - window_size + 2, step_size):
+        end = start + window_size - 1
+        indices = [i for i, p in enumerate(positions_all) if start <= p <= end]
+        if len(indices) == 0: continue
+        alt_sum = 0.0
+        for i in indices:
+            pos = positions_all[i]
+            ref = ref_nuc.get(pos)
+            for nuc in 'ACGT':
+                if nuc == ref or nuc not in per_pos[pos]: continue
+                alt_sum += metrics[pos][nuc].get(metric_name, 0)
+        windows.append((start, end, indices, alt_sum))
+    log_print(f"   Оконный анализ ({metric_name}) для {len(windows)} окон...")
+    pvals = []
+    for win_idx, (start, end, indices, alt_sum) in enumerate(windows):
+        perm_sums = []
+        for _ in range(n_perm):
+            rand_indices = np.random.choice(n_pos, size=len(indices), replace=False)
+            perm_sum = np.sum(ref_vals[rand_indices])
+            perm_sums.append(perm_sum)
+        p = (np.sum(np.array(perm_sums) >= alt_sum) + 1) / (n_perm + 1)
+        pvals.append(p)
+        if (win_idx+1) % 20 == 0:
+            log_print(f"   ... обработано {win_idx+1}/{len(windows)} окон")
+    if STATSMODELS_AVAILABLE:
+        _, qvals, _, _ = multipletests(pvals, method='fdr_bh')
+    else:
+        qvals = np.ones_like(pvals)
+    positions = [(s+e)//2 for s,e,_ in windows]
+    logp = -np.log10(np.maximum(pvals, 1e-300))
+    fig, ax = plt.subplots(figsize=(14,5))
+    ax.scatter(positions, logp, c='black', s=5)
+    sig_wins = [i for i, q in enumerate(qvals) if q < 0.05]
+    if sig_wins:
+        ax.scatter([positions[i] for i in sig_wins], [logp[i] for i in sig_wins], c='red', s=10)
+    ax.axhline(-np.log10(0.05), color='gray', linestyle='--', alpha=0.5, label='Nominal α=0.05')
+    ax.axhline(-np.log10(np.max(pvals[np.array(qvals) < 0.05] if sig_wins else [1])), color='red', linestyle='--', label='FDR threshold')
+    ax.set_title(f'Windowed Manhattan – {metric_name} (window {window_size}bp, step {step_size}bp)')
+    ax.set_xlabel('Position'); ax.set_ylabel('-log10(p)')
+    ax.legend(title='Permutation test + FDR')
+    plt.tight_layout()
+    return fig, ax
+
+import heapq
+
+def compute_max_coverage(all_repeats, MT_LEN):
+    max_len = np.zeros(MT_LEN + 1, dtype=np.int32)   # теперь индекс 0 – не используется
+    if not all_repeats:
+        return max_len
+    events = []
+    for start, end, eff in all_repeats:
+        if end > MT_LEN:
+            end = MT_LEN
+        events.append((start, 1, eff))
+        events.append((end + 1, -1, eff))
+    events.sort(key=lambda x: (x[0], -x[1]))
+    max_heap = []
+    remove_heap = []
+    event_idx = 0
+    n_events = len(events)
+    for pos in range(1, MT_LEN + 1):
+        while event_idx < n_events and events[event_idx][0] == pos:
+            _, typ, eff = events[event_idx]
+            if typ == 1:
+                heapq.heappush(max_heap, -eff)
+            else:
+                heapq.heappush(remove_heap, -eff)
+            event_idx += 1
+        while remove_heap and max_heap and remove_heap[0] == max_heap[0]:
+            heapq.heappop(remove_heap)
+            heapq.heappop(max_heap)
+        if max_heap:
+            max_len[pos] = -max_heap[0]   # записываем в позицию pos
+    return max_len
+
+def compute_coverage(all_repeats, MT_LEN, weighted=False):
+    """Быстрое вычисление покрытия через разностный массив и cumsum.
+    Возвращает массив длиной MT_LEN+1, где индекс 0 игнорируется,
+    а индексы 1..MT_LEN соответствуют позициям."""
+    cov = np.zeros(MT_LEN + 2, dtype=np.float64)
+    if not all_repeats:
+        return cov[:MT_LEN+1]
+
+    starts = np.array([item[0] for item in all_repeats], dtype=np.int32)
+    ends   = np.array([item[1] for item in all_repeats], dtype=np.int32)
+    ends = np.clip(ends, 0, MT_LEN)
+
+    if weighted:
+        weights = np.array([item[2] for item in all_repeats], dtype=np.float64)
+    else:
+        weights = np.ones(len(starts), dtype=np.float64)
+
+    np.add.at(cov, starts, weights)
+
+    valid = ends + 1 <= MT_LEN
+    if valid.any():
+        np.add.at(cov, ends[valid] + 1, -weights[valid])
+
+    cov = np.cumsum(cov)[:MT_LEN+1]
     return cov
 
-def run_stats(input_dir, output_dir, ref_path, workers):
+
+def run_stats(input_dir, output_dir, ref_path, workers, window_size=0, snv_file=None):
     output_dir.mkdir(parents=True, exist_ok=True)
     log_path = output_dir / "stats_run.log"
     logf = open(log_path, 'w', encoding='utf-8')
@@ -470,15 +529,14 @@ def run_stats(input_dir, output_dir, ref_path, workers):
 
     log_print("Загрузка референсной последовательности...")
     ref_seq = read_reference(ref_path)
-    if len(ref_seq) != MT_LEN:
-        log_print(f"Внимание: длина {len(ref_seq)} вместо {MT_LEN}.")
+    MT_LEN = len(ref_seq)
+    log_print(f"Длина референса: {MT_LEN}")
 
     log_print("Чтение очищенных файлов...")
-    per_pos, ref_nuc, all_repeats_raw, all_repeats_weighted, metrics = load_cleaned_files(input_dir, ref_seq, log_print)
+    per_pos, ref_nuc, all_repeats_raw, all_repeats_weighted, metrics = load_cleaned_files(input_dir, ref_seq, log_print, MT_LEN)
     log_print(f"Позиций с данными: {len(per_pos)}")
 
     # ----- Фон -----
-    log_print("Подготовка фонов...")
     ref_metrics_names = ['total', 'perfect', 'max_eff', 'sum_eff',
                          'count_ge7', 'perfect_ge7', 'imperfect_ge10']
     ref_backgrounds = {name: [] for name in ref_metrics_names}
@@ -488,11 +546,9 @@ def run_stats(input_dir, output_dir, ref_path, workers):
             m = metrics[pos][ref]
             for name in ref_metrics_names:
                 ref_backgrounds[name].append(m[name])
-    for name in ref_metrics_names:
-        log_print(f"   {name}: {len(ref_backgrounds[name])} референсных значений")
+    log_print("Фоны подготовлены.")
 
-    # ----- Манхеттены для всех метрик -----
-    log_print("Построение манхеттенов...")
+    # ----- Манхеттены (MAD-Z тест) -----
     titles = {
         'total': 'Total repeats', 'perfect': 'Perfect repeats',
         'count_ge7': 'Repeats ≥7 (all)', 'perfect_ge7': 'Perfect repeats ≥7',
@@ -505,11 +561,7 @@ def run_stats(input_dir, output_dir, ref_path, workers):
         ax = axes[idx]
         bg = ref_backgrounds[metric]
         title = titles[metric]
-
-        # Попытка обучить ZINB один раз для логирования
-        if STATSMODELS_AVAILABLE:
-            _ = fit_zinb(bg, log_print)   # результат не храним, просто лог
-
+        # Порог фильтрации (MAD)
         all_deltas = []
         for pos in sorted(per_pos.keys()):
             ref = ref_nuc.get(pos)
@@ -519,14 +571,13 @@ def run_stats(input_dir, output_dir, ref_path, workers):
                 if nuc == ref or nuc not in per_pos[pos]: continue
                 all_deltas.append(metrics[pos][nuc][metric] - ref_val)
         if len(all_deltas) > 1:
-            med = np.median(all_deltas)
-            mad = np.median(np.abs(np.array(all_deltas) - med))
-            threshold = 1.5 * mad if metric != 'max_eff' else 1.0 * mad
+            med_delta = np.median(all_deltas)
+            mad_delta = np.median(np.abs(np.array(all_deltas) - med_delta))
+            threshold = 1.5 * mad_delta if metric != 'max_eff' else 1.0 * mad_delta
         else:
             threshold = 0
-        log_print(f"\n {title}: MAD={mad:.2f}, порог |Δ| > {threshold:.2f}")
+        log_print(f"\n {title}: MAD={mad_delta:.2f}, порог |Δ| > {threshold:.2f}")
         positions, pvals = [], []
-        info_list = []
         tested_total, tested_passed = 0, 0
         last_report = 0
         for pos in sorted(per_pos.keys()):
@@ -540,23 +591,22 @@ def run_stats(input_dir, output_dir, ref_path, workers):
                 delta = alt_val - ref_val
                 if abs(delta) <= threshold: continue
                 tested_passed += 1
-                pval, info = parametric_pvalue(alt_val, bg, metric, log_print=None)  # не спамим ZINB логом для каждой точки
+                pval, info = mad_zscore_pvalue(alt_val, bg)
                 positions.append(pos)
                 pvals.append(pval)
-                info_list.append((pos, nuc, alt_val, pval, info))
-                # Прогресс каждые 1000
                 if tested_passed - last_report >= 1000:
                     log_print(f"   ... обработано {tested_passed} тестов (pmin={min(pvals):.2e})")
                     last_report = tested_passed
         log_print(f"   Всего тестов: {tested_total}, после фильтрации: {tested_passed}")
-        if info_list:
-            info_list_sorted = sorted(info_list, key=lambda x: x[3])
-            log_print("   Топ-5 экстремальных значений:")
-            for pos, nuc, val, p, inf in info_list_sorted[:5]:
-                log_print(f"     pos={pos} {nuc}: значение={val}, p={p:.2e}, тест={inf.get('test','?')}, параметры={inf.get('params','N/A')}")
-            first_info = info_list_sorted[0][4]
-            log_print(f"   Применённый тест: {first_info.get('test','?')}, параметры: {first_info.get('params','N/A')}")
-            log_print(f"   Минимальное p-value до FDR: {info_list_sorted[0][3]:.2e}")
+        if pvals:
+            info_list = sorted(zip(positions, pvals), key=lambda x: x[1])
+            log_print("   Топ-5 p-values:")
+            for pos, p in info_list[:5]:
+                log_print(f"     pos={pos}, p={p:.2e}")
+            log_print(f"   Минимальное p-value до FDR: {info_list[0][1]:.2e}")
+            # Тест для легенды
+            _, info_test = mad_zscore_pvalue(bg[0], bg)  # чтобы получить тип теста
+            test_name = info_test.get('test', 'MAD-Z')
         else:
             log_print("   Нет точек после фильтрации.")
         if not pvals:
@@ -566,134 +616,25 @@ def run_stats(input_dir, output_dir, ref_path, workers):
         logp = -np.log10(np.maximum(pvals, 1e-300))
         ax.scatter(positions, logp, c='black', s=5)
         ax.set_title(f'Manhattan plot – {title}')
-        add_significance_lines(ax, pvals, log_print=log_print)
+        add_significance_lines(ax, pvals, log_print=log_print, test_name=test_name)
     plt.tight_layout()
     plt.savefig(output_dir / 'manhattan_metrics.png', dpi=150); plt.close()
     log_print("\n Манхеттены метрик сохранены.")
 
-
-    # ----- Графики максимальной длины повтора на позицию -----
-    log_print("\nГрафики максимальной длины повтора на позицию...")
-    max_len_all = np.zeros(MT_LEN+1, dtype=int)
-    max_len_perfect = np.zeros(MT_LEN+1, dtype=int)
-
-    all_repeats_perfect_weighted = []
-    for pos, nucs in per_pos.items():
-        for nuc, lines in nucs.items():
-            for l in lines:
-                p = l.split('\t')
-                try:
-                    hamming = int(p[9])
-                    eff = int(p[3]) - hamming
-                    rs, re = int(p[7]), int(p[8])
-                except: continue
-                if hamming == 0:
-                    if rs <= re:
-                        all_repeats_perfect_weighted.append((rs, re, eff))
-                    else:
-                        all_repeats_perfect_weighted.append((rs, MT_LEN, eff))
-                        all_repeats_perfect_weighted.append((1, re, eff))
-    for start, end, eff in all_repeats_weighted:
-        if end > MT_LEN: end = MT_LEN
-        max_len_all[start:end+1] = np.maximum(max_len_all[start:end+1], eff)
-    for start, end, eff in all_repeats_perfect_weighted:
-        if end > MT_LEN: end = MT_LEN
-        max_len_perfect[start:end+1] = np.maximum(max_len_perfect[start:end+1], eff)
-
-    cov_raw = compute_coverage(all_repeats_raw, weighted=False)
-    bin_size = MT_LEN // 8
-    bins = np.arange(1, MT_LEN+2, bin_size)
-    counts_hist, _ = np.histogram(np.arange(1, MT_LEN+1), bins=bins, weights=cov_raw[1:])
-
-    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(14, 10))
-    x = np.arange(1, MT_LEN+1)
-    ax1.plot(x, max_len_all[1:], linewidth=0.7, color='darkblue')
-    ax1.set_title('Maximum repeat length per position (all repeats)')
-    ax1.set_ylabel('Max eff. length')
-    ax1.bar(bins[:-1], counts_hist, width=bin_size, align='edge', color='lightblue', alpha=0.3, edgecolor='none')
-    region1 = cov_raw[6000:8001]
-    region2 = cov_raw[14000:16001]
-    if len(region1) > 0 and len(region2) > 0:
-        u_stat, p_region = stats.mannwhitneyu(region1, region2, alternative='two-sided')
-        log_print(f" Сравнение покрытия (6-8k vs 14-16k): Mann-Whitney p={p_region:.2e}")
-        ax1.annotate(f'p(MW) = {p_region:.2e}', xy=(0.5, 0.95), xycoords='axes fraction', ha='center', fontsize=9,
-                     bbox=dict(boxstyle='round', facecolor='white', alpha=0.8))
-    else:
-        log_print(" Недостаточно данных для сравнения регионов.")
-
-    ax2.plot(x, max_len_perfect[1:], linewidth=0.7, color='darkgreen')
-    ax2.set_title('Maximum perfect repeat length per position')
-    ax2.set_xlabel('Position')
-    ax2.set_ylabel('Max eff. length')
-    ax2.bar(bins[:-1], counts_hist, width=bin_size, align='edge', color='lightgreen', alpha=0.3, edgecolor='none')
-    if len(region1) > 0 and len(region2) > 0:
-        ax2.annotate(f'p(MW) = {p_region:.2e}', xy=(0.5, 0.95), xycoords='axes fraction', ha='center', fontsize=9,
-                     bbox=dict(boxstyle='round', facecolor='white', alpha=0.8))
-    plt.tight_layout()
-    plt.savefig(output_dir / 'max_repeat_length_per_position.png', dpi=150); plt.close()
-    log_print(" Графики максимальной длины повтора сохранены.")
-
-    # Гистограмма 1/8
-    fig, ax = plt.subplots(figsize=(10,5))
-    ax.bar(bins[:-1], counts_hist, width=bin_size, align='edge', color='lightblue', edgecolor='black')
-    ax.set_xlabel('Position')
-    ax.set_ylabel('Total repeat count (coverage)')
-    ax.set_title('Repeat coverage per 1/8 mtDNA bins')
-    if len(region1) > 0 and len(region2) > 0:
-        ax.annotate(f'6-8k vs 14-16k p={p_region:.2e}', xy=(0.5, 0.95), xycoords='axes fraction', ha='center', fontsize=10,
-                    bbox=dict(boxstyle='round', facecolor='white', alpha=0.9))
-    plt.tight_layout(); plt.savefig(output_dir / 'histogram_1_8_coverage.png', dpi=150); plt.close()
-    if len(region1) > 0 and len(region2) > 0:
-        log_print(f"\nСравнение регионов 6-8k и 14-16k:")
-        log_print(f"  Среднее покрытие 6-8k: {np.mean(region1):.1f}, 14-16k: {np.mean(region2):.1f}")
-        log_print(f"  Mann-Whitney U = {u_stat:.1f}, p-value = {p_region:.2e}")
-
-    # ----- Покрытия -----
-    log_print("Расчёт покрытий...")
-    cov_weighted = compute_coverage(all_repeats_weighted, weighted=True)
+    # ----- Покрытия (MAD-Z для coverage) -----
+    cov_raw = compute_coverage(all_repeats_raw, MT_LEN, weighted=False)
+    cov_weighted = compute_coverage(all_repeats_weighted, MT_LEN, weighted=True)
     for cov, name in [(cov_raw, 'Raw coverage'), (cov_weighted, 'Weighted coverage')]:
-        log_print(f"\n {name}:")
-        bg_cov = cov[1:].astype(int)
-        mu_cov = np.mean(bg_cov)
-        var_cov = np.var(bg_cov)
-        if var_cov > mu_cov + 1:
-            p_cov = mu_cov / var_cov
-            r_cov = mu_cov * p_cov / (1 - p_cov) if p_cov < 1 else 100
-            log_print(f"   Negative Binomial: r={r_cov:.2f}, p={p_cov:.4f}")
-        else:
-            r_cov, p_cov = None, None
-            log_print("   Poisson (дисперсия <= среднее)")
+        bg_cov = cov[1:]
         pvals_cov = []
         for pos in range(1, MT_LEN+1):
-            obs = cov[pos]
-            if r_cov is not None:
-                if obs <= mu_cov:
-                    left = nbinom.cdf(obs, r_cov, p_cov)
-                    right_obs = int(2*mu_cov - obs)
-                    right = nbinom.sf(right_obs-1, r_cov, p_cov) if right_obs >=0 else 1.0
-                    pval = left + right
-                else:
-                    right = nbinom.sf(obs-1, r_cov, p_cov)
-                    left_obs = int(2*mu_cov - obs)
-                    left = nbinom.cdf(left_obs, r_cov, p_cov) if left_obs >=0 else 0.0
-                    pval = left + right
-            else:
-                if obs <= mu_cov:
-                    left = poisson.cdf(obs, mu_cov)
-                    right_obs = int(2*mu_cov - obs)
-                    right = poisson.sf(right_obs-1, mu_cov) if right_obs >=0 else 1.0
-                    pval = left + right
-                else:
-                    right = poisson.sf(obs-1, mu_cov)
-                    left_obs = int(2*mu_cov - obs)
-                    left = poisson.cdf(left_obs, mu_cov) if left_obs >=0 else 0.0
-                    pval = left + right
-            pvals_cov.append(max(min(pval, 1.0), 0.0))
+            pval, _ = mad_zscore_pvalue(cov[pos], bg_cov)
+            pvals_cov.append(pval)
         logp_cov = -np.log10(np.maximum(pvals_cov, 1e-300))
         fig, ax = plt.subplots(figsize=(14,5))
         ax.scatter(range(1, MT_LEN+1), logp_cov, c='steelblue', s=2)
         ax.set_title(f'Manhattan – {name}')
-        add_significance_lines(ax, pvals_cov, log_print=log_print)
+        add_significance_lines(ax, pvals_cov, log_print=log_print, test_name='MAD-Z')
         plt.tight_layout()
         plt.savefig(output_dir / f'manhattan_{name.replace(" ","_")}.png', dpi=150); plt.close()
 
@@ -705,9 +646,84 @@ def run_stats(input_dir, output_dir, ref_path, workers):
     ax.legend(); ax.set_title('Weighted coverage along mtDNA')
     plt.tight_layout(); plt.savefig(output_dir / 'coverage_plot.png', dpi=150); plt.close()
 
-    # ----- Гистограммы -----
-    log_print("\nГистограммы...")
-    fig, (ax1, ax2) = plt.subplots(1,2, figsize=(12,5))
+    # ----- Графики максимальной длины повтора на позицию (sweep line) -----
+    log_print("Построение графиков максимальной длины повтора на позицию (sweep line)...")
+
+    # Убедимся, что all_repeats_perfect_weighted собран (если нет, собираем)
+    if 'all_repeats_perfect_weighted' not in dir() or not all_repeats_perfect_weighted:
+        all_repeats_perfect_weighted = []
+        for pos, nucs in per_pos.items():
+            for nuc, lines in nucs.items():
+                for l in lines:
+                    p = l.split('\t')
+                    try:
+                        hamming = int(p[9])
+                        eff = int(p[3]) - hamming
+                        rs, re = int(p[7]), int(p[8])
+                    except:
+                        continue
+                    if hamming == 0:
+                        if rs <= re:
+                            all_repeats_perfect_weighted.append((rs, re, eff))
+                        else:
+                            all_repeats_perfect_weighted.append((rs, MT_LEN, eff))
+                            all_repeats_perfect_weighted.append((1, re, eff))
+
+    # Правильные вызовы: max_len использует взвешенные списки
+    max_len_all = compute_max_coverage(all_repeats_weighted, MT_LEN)
+    max_len_perfect = compute_max_coverage(all_repeats_perfect_weighted, MT_LEN)
+
+    # Обычное покрытие для гистограммы
+    cov_raw = compute_coverage(all_repeats_raw, MT_LEN, weighted=False)
+
+    bin_size = MT_LEN // 8
+    bins = np.arange(1, MT_LEN + 2, bin_size)
+    counts_hist, _ = np.histogram(np.arange(1, MT_LEN + 1), bins=bins, weights=cov_raw[1:])
+
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(14, 10))
+    x = np.arange(1, MT_LEN + 1)
+    ax1.plot(x, max_len_all, linewidth=0.7, color='darkblue')
+    ax1.set_title('Maximum repeat length per position (all repeats)')
+    ax1.set_ylabel('Max eff. length')
+    ax1.bar(bins[:-1], counts_hist, width=bin_size, align='edge', color='lightblue', alpha=0.3, edgecolor='none')
+    region1 = cov_raw[6000:8001]
+    region2 = cov_raw[14000:16001]
+    if len(region1) > 0 and len(region2) > 0:
+        u_stat, p_region = mannwhitneyu(region1, region2, alternative='two-sided')
+        log_print(f" Сравнение покрытия (6-8k vs 14-16k): Mann-Whitney p={p_region:.2e}")
+        ax1.annotate(f'p(MW) = {p_region:.2e}', xy=(0.5, 0.95), xycoords='axes fraction', ha='center',
+                     fontsize=9, bbox=dict(boxstyle='round', facecolor='white', alpha=0.8))
+    else:
+        log_print(" Недостаточно данных для сравнения регионов.")
+
+    ax2.plot(x, max_len_perfect, linewidth=0.7, color='darkgreen')
+    ax2.set_title('Maximum perfect repeat length per position')
+    ax2.set_xlabel('Position')
+    ax2.set_ylabel('Max eff. length')
+    ax2.bar(bins[:-1], counts_hist, width=bin_size, align='edge', color='lightgreen', alpha=0.3, edgecolor='none')
+    if len(region1) > 0 and len(region2) > 0:
+        ax2.annotate(f'p(MW) = {p_region:.2e}', xy=(0.5, 0.95), xycoords='axes fraction', ha='center',
+                     fontsize=9, bbox=dict(boxstyle='round', facecolor='white', alpha=0.8))
+    plt.tight_layout()
+    plt.savefig(output_dir / 'max_repeat_length_per_position.png', dpi=150)
+    plt.close()
+    log_print(" Графики максимальной длины повтора сохранены.")
+
+    # Отдельная гистограмма 1/8
+    fig, ax = plt.subplots(figsize=(10, 5))
+    ax.bar(bins[:-1], counts_hist, width=bin_size, align='edge', color='lightblue', edgecolor='black')
+    ax.set_xlabel('Position')
+    ax.set_ylabel('Total repeat count (coverage)')
+    ax.set_title('Repeat coverage per 1/8 mtDNA bins')
+    if len(region1) > 0 and len(region2) > 0:
+        ax.annotate(f'6-8k vs 14-16k p={p_region:.2e}', xy=(0.5, 0.95), xycoords='axes fraction', ha='center',
+                    fontsize=10, bbox=dict(boxstyle='round', facecolor='white', alpha=0.9))
+    plt.tight_layout()
+    plt.savefig(output_dir / 'histogram_1_8_coverage.png', dpi=150)
+    plt.close()
+
+    # ----- Гистограммы с KDE -----
+    fig, (ax1, ax2) = plt.subplots(1,2,figsize=(12,5))
     vals = cov_weighted[1:]
     ax1.hist(vals, bins=50, density=True, color='lightblue', edgecolor='black', alpha=0.7)
     if len(vals)>1:
@@ -728,8 +744,7 @@ def run_stats(input_dir, output_dir, ref_path, workers):
              transform=ax2.transAxes, va='top', ha='right', bbox=dict(facecolor='white', alpha=0.8))
     plt.tight_layout(); plt.savefig(output_dir / 'histograms.png', dpi=150); plt.close()
 
-    # ----- Scatter -----
-    log_print("Scatter plots...")
+    # ----- Scatter plots (jitter + регрессия) -----
     def max_eff_len(lines, perfect_only=False):
         mx = 0
         for l in lines:
@@ -753,8 +768,6 @@ def run_stats(input_dir, output_dir, ref_path, workers):
             al_perf = max_eff_len(alt_lines, True)
             al_imperf = max_eff_len(alt_lines, False)
             scatter_data.append((rl_perf, al_perf - rl_perf, rl_imperf, al_imperf - rl_imperf, al_perf, al_imperf))
-    log_print(f" Точек для scatter: {len(scatter_data)}")
-
     def scatter_with_regression(ax, x, y, color, alpha=0.3):
         if len(x)==0: return
         x_jit = x + np.random.normal(0, 0.5, size=len(x))
@@ -766,25 +779,23 @@ def run_stats(input_dir, output_dir, ref_path, workers):
             ax.plot(line_x, slope*line_x+intercept, 'k--')
             ax.text(0.02,0.98, f'R²={r**2:.3f}\np={p:.2e}', transform=ax.transAxes, va='top',
                     bbox=dict(boxstyle='round', facecolor='white', alpha=0.8), fontsize=7)
-
+    # delta perfect
     x_p = np.array([d[0] for d in scatter_data])
     y_p = np.array([d[1] for d in scatter_data])
     fig, ax = plt.subplots(figsize=(8,6))
     scatter_with_regression(ax, x_p, y_p, 'blue')
     ax.set_xlabel('Ref max eff. perfect'); ax.set_ylabel('Δ perfect')
-    ax.axhline(0, color='gray', linestyle='--')
-    ax.set_title('Perfect: Δ vs ref')
+    ax.axhline(0, color='gray', linestyle='--'); ax.set_title('Perfect: Δ vs ref')
     plt.tight_layout(); plt.savefig(output_dir / 'scatter_delta_perfect.png', dpi=150); plt.close()
-
+    # delta imperfect
     x_i = np.array([d[2] for d in scatter_data])
     y_i = np.array([d[3] for d in scatter_data])
     fig, ax = plt.subplots(figsize=(8,6))
     scatter_with_regression(ax, x_i, y_i, 'red')
     ax.set_xlabel('Ref max eff. imperfect'); ax.set_ylabel('Δ imperfect')
-    ax.axhline(0, color='gray', linestyle='--')
-    ax.set_title('Imperfect: Δ vs ref')
+    ax.axhline(0, color='gray', linestyle='--'); ax.set_title('Imperfect: Δ vs ref')
     plt.tight_layout(); plt.savefig(output_dir / 'scatter_delta_imperfect.png', dpi=150); plt.close()
-
+    # alt vs ref perfect
     x_ref = np.array([d[0] for d in scatter_data])
     y_alt = np.array([d[4] for d in scatter_data])
     fig, ax = plt.subplots(figsize=(8,6))
@@ -794,19 +805,14 @@ def run_stats(input_dir, output_dir, ref_path, workers):
     ax.set_title('Perfect: alt vs ref')
     plt.tight_layout(); plt.savefig(output_dir / 'scatter_alt_vs_ref_perfect.png', dpi=150); plt.close()
 
-    # ----- Боксплоты 99-го перцентиля (основные и по самым длинным повторам) -----
-    log_print("Боксплоты 99-го перцентиля...")
+    # ----- Боксплоты 99-го перцентиля (Δ, GC, H-bonds, longest) -----
     ti_perf, tv_perf, ti_imperf, tv_imperf = [], [], [], []
-    # Для GC/H-bonds по самым длинным повторам
-    gc_long_ti, gc_long_tv, hb_long_ti, hb_long_tv = [], [], [], []
     for pos in sorted(per_pos.keys()):
         ref = ref_nuc.get(pos)
         if not ref or ref not in per_pos[pos]: continue
         ref_lines = per_pos[pos][ref]
         rp = max_eff_len(ref_lines, True)
         ri = max_eff_len(ref_lines, False)
-        # Самые длинные повторы в референсе (все, не только perfect)
-        max_eff_ref = max_eff_len(ref_lines, False)
         for nuc in 'ACGT':
             if nuc == ref or nuc not in per_pos[pos]: continue
             alt_lines = per_pos[pos][nuc]
@@ -817,60 +823,18 @@ def run_stats(input_dir, output_dir, ref_path, workers):
                 ti_perf.append(abs(ap-rp)); ti_imperf.append(abs(ai-ri))
             else:
                 tv_perf.append(abs(ap-rp)); tv_imperf.append(abs(ai-ri))
-            # GC/H для самого длинного повтора в альтернативном файле
-            max_eff_alt = max_eff_len(alt_lines, False)
-            # Ищем этот повторы, чтобы извлечь GC/H
-            alt_gc_long = []
-            alt_hb_long = []
-            for l in alt_lines:
-                p = l.split('\t')
-                try: eff = int(p[3]) - int(p[9])
-                except: continue
-                if eff == max_eff_alt:
-                    if len(p) >= 15:
-                        alt_gc_long.append(float(p[11]))
-                        alt_hb_long.append(int(p[13]))
-            if alt_gc_long and alt_hb_long:
-                # Берём среднее (если несколько с одинаковой длиной)
-                avg_gc = np.mean(alt_gc_long)
-                avg_hb = np.mean(alt_hb_long)
-                # Референсные тоже
-                ref_gc_long = []
-                ref_hb_long = []
-                for l in ref_lines:
-                    p = l.split('\t')
-                    try: eff = int(p[3]) - int(p[9])
-                    except: continue
-                    if eff == max_eff_ref:
-                        if len(p) >= 15:
-                            ref_gc_long.append(float(p[11]))
-                            ref_hb_long.append(int(p[13]))
-                if ref_gc_long and ref_hb_long:
-                    ref_avg_gc = np.mean(ref_gc_long)
-                    ref_avg_hb = np.mean(ref_hb_long)
-                    diff_gc = abs(avg_gc - ref_avg_gc)
-                    diff_hb = abs(avg_hb - ref_avg_hb)
-                    if is_ti:
-                        gc_long_ti.append(diff_gc)
-                        hb_long_ti.append(diff_hb)
-                    else:
-                        gc_long_tv.append(diff_gc)
-                        hb_long_tv.append(diff_hb)
-
     def plot_perc(ax, data, labels, title):
         vals = [np.percentile(d, 99) if d else np.nan for d in data]
         ax.bar(labels, vals, color=['blue','red'])
         for i,v in enumerate(vals):
             if not np.isnan(v): ax.text(i, v, f'{v:.1f}', ha='center', va='bottom')
         ax.set_title(title)
-
-    # Основные перцентили Delta
-    fig, (ax1,ax2) = plt.subplots(1,2, figsize=(10,4))
+    fig, (ax1,ax2) = plt.subplots(1,2,figsize=(10,4))
     plot_perc(ax1, [ti_perf, tv_perf], ['Transition','Transversion'], '99th %ile |Δ| perfect')
     plot_perc(ax2, [ti_imperf, tv_imperf], ['Transition','Transversion'], '99th %ile |Δ| imperfect')
     plt.tight_layout(); plt.savefig(output_dir / 'boxplot_99percentile_delta.png', dpi=150); plt.close()
 
-    # Перцентили GC/H (все повторы, старые)
+    # GC/H differences (all repeats)
     gc_ti, gc_tv, hb_ti, hb_tv = [], [], [], []
     for pos in sorted(per_pos.keys()):
         ref = ref_nuc.get(pos)
@@ -889,20 +853,50 @@ def run_stats(input_dir, output_dir, ref_path, workers):
                 gc_ti.append(abs(agc-rgc)); hb_ti.append(abs(ahb-rhb))
             else:
                 gc_tv.append(abs(agc-rgc)); hb_tv.append(abs(ahb-rhb))
-    fig, (ax1,ax2) = plt.subplots(1,2, figsize=(10,4))
+    fig, (ax1,ax2) = plt.subplots(1,2,figsize=(10,4))
     plot_perc(ax1, [gc_ti, gc_tv], ['Transition','Transversion'], '99th %ile |ΔGC|')
     plot_perc(ax2, [hb_ti, hb_tv], ['Transition','Transversion'], '99th %ile |ΔH-bonds|')
     plt.tight_layout(); plt.savefig(output_dir / 'boxplot_99percentile_gc_hb.png', dpi=150); plt.close()
 
-    # Перцентили GC/H для самых длинных повторов
-    fig, (ax1,ax2) = plt.subplots(1,2, figsize=(10,4))
-    plot_perc(ax1, [gc_long_ti, gc_long_tv], ['Transition','Transversion'], '99th %ile |ΔGC| (longest repeats)')
-    plot_perc(ax2, [hb_long_ti, hb_long_tv], ['Transition','Transversion'], '99th %ile |ΔH-bonds| (longest repeats)')
+    # GC/H для самых длинных повторов (longest)
+    gc_long_ti, gc_long_tv, hb_long_ti, hb_long_tv = [], [], [], []
+    for pos in sorted(per_pos.keys()):
+        ref = ref_nuc.get(pos)
+        if not ref or ref not in per_pos[pos]: continue
+        ref_lines = per_pos[pos][ref]
+        max_eff_ref = max_eff_len(ref_lines, False)
+        for nuc in 'ACGT':
+            if nuc == ref or nuc not in per_pos[pos]: continue
+            alt_lines = per_pos[pos][nuc]
+            max_eff_alt = max_eff_len(alt_lines, False)
+            alt_gc_long = []; alt_hb_long = []
+            for l in alt_lines:
+                p = l.split('\t')
+                try: eff = int(p[3]) - int(p[9])
+                except: continue
+                if eff == max_eff_alt and len(p) >= 15:
+                    alt_gc_long.append(float(p[11])); alt_hb_long.append(int(p[13]))
+            ref_gc_long = []; ref_hb_long = []
+            for l in ref_lines:
+                p = l.split('\t')
+                try: eff = int(p[3]) - int(p[9])
+                except: continue
+                if eff == max_eff_ref and len(p) >= 15:
+                    ref_gc_long.append(float(p[11])); ref_hb_long.append(int(p[13]))
+            if alt_gc_long and ref_gc_long:
+                diff_gc = abs(np.mean(alt_gc_long) - np.mean(ref_gc_long))
+                diff_hb = abs(np.mean(alt_hb_long) - np.mean(ref_hb_long))
+                is_ti = {ref, nuc} in ({'A','G'}, {'C','T'})
+                if is_ti:
+                    gc_long_ti.append(diff_gc); hb_long_ti.append(diff_hb)
+                else:
+                    gc_long_tv.append(diff_gc); hb_long_tv.append(diff_hb)
+    fig, (ax1,ax2) = plt.subplots(1,2,figsize=(10,4))
+    plot_perc(ax1, [gc_long_ti, gc_long_tv], ['Transition','Transversion'], '99th %ile |ΔGC| (longest)')
+    plot_perc(ax2, [hb_long_ti, hb_long_tv], ['Transition','Transversion'], '99th %ile |ΔH-bonds| (longest)')
     plt.tight_layout(); plt.savefig(output_dir / 'boxplot_99percentile_gc_hb_longest.png', dpi=150); plt.close()
-    log_print(" Боксплоты сохранены (включая longest repeats).")
 
-    # ----- Heatmaps -----
-    log_print("Heatmap...")
+    # ----- Heatmap (max perfect Δ и all repeats Δ) -----
     transitions_max = defaultdict(list)
     for pos in sorted(per_pos.keys()):
         ref = ref_nuc.get(pos)
@@ -979,10 +973,8 @@ def run_stats(input_dir, output_dir, ref_path, workers):
                         color='white' if abs(hm2[i,j])>np.max(np.abs(hm2))/2 else 'black')
     ax.set_title('Heatmap all repeats Δ (* FDR<0.05)')
     plt.tight_layout(); plt.savefig(output_dir / 'heatmap_all_repeats.png', dpi=150); plt.close()
-    log_print(" Heatmap сохранены.")
 
     # ----- GC/H-bonds средние -----
-    log_print("Инфографика GC/H-bonds...")
     rgc_m, rgc_r, agc_m, agc_r = [], [], [], []
     rhb_m, rhb_r, ahb_m, ahb_r = [], [], [], []
     for pos in sorted(per_pos.keys()):
@@ -1017,29 +1009,119 @@ def run_stats(input_dir, output_dir, ref_path, workers):
     plt.suptitle('Mean ± SD')
     plt.tight_layout(); plt.savefig(output_dir / 'gc_hbonds_infographic.png', dpi=150); plt.close()
 
+    # ----- Зависимость от major arc (расстояние) -----
+    distances = []
+    met_vals = []
+    for pos in per_pos.keys():
+        if not ref_nuc.get(pos): continue
+        dist_start = min(abs(pos - MAJOR_ARC_START), MT_LEN - abs(pos - MAJOR_ARC_START))
+        dist_end = min(abs(pos - MAJOR_ARC_END), MT_LEN - abs(pos - MAJOR_ARC_END))
+        dist = min(dist_start, dist_end)
+        ref_n = ref_nuc[pos]
+        if ref_n in per_pos[pos]:
+            val = metrics[pos][ref_n]['long_count']
+            distances.append(dist)
+            met_vals.append(val)
+    bins = np.arange(0, max(distances)+100, 100)
+    bin_centers = (bins[:-1] + bins[1:])/2
+    binned_mean = [np.mean(np.array(met_vals)[(np.array(distances)>=bins[i]) & (np.array(distances)<bins[i+1])]) for i in range(len(bins)-1)]
+    fig, ax = plt.subplots(figsize=(10,4))
+    ax.plot(bin_centers, binned_mean, 'o-')
+    ax.set_xlabel('Distance to nearest major arc boundary (bp)')
+    ax.set_ylabel('Mean long_count (ref)')
+    ax.set_title('Repeatability vs distance from major arc boundaries')
+    plt.tight_layout(); plt.savefig(output_dir / 'major_arc_distance.png', dpi=150); plt.close()
+
+    # ----- Оконный анализ -----
+    if window_size > 0 and STATSMODELS_AVAILABLE:
+        log_print("\n=== Оконный анализ ===")
+        for metric in ['total', 'perfect', 'count_ge7', 'perfect_ge7', 'imperfect_ge10']:
+            fig, _ = windowed_analysis(per_pos, ref_nuc, metrics, metric, MT_LEN, window_size=window_size)
+            fig.savefig(output_dir / f'manhattan_window_{metric}.png', dpi=150)
+            plt.close(fig)
+
+    # ----- Forest plot для CSV с мутациями -----
+    if snv_file:
+        log_print(f"\n=== Forest plot для мутаций из {snv_file} ===")
+        snv_data = []
+        with open(snv_file, 'r') as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                pos = int(row['position'])
+                ref_allele = row['ref_allele'].upper()
+                alt_allele = row['alt_allele'].upper()
+                if pos in per_pos and ref_allele in per_pos[pos] and alt_allele in per_pos[pos]:
+                    ref_lines = per_pos[pos][ref_allele]
+                    alt_lines = per_pos[pos][alt_allele]
+                    rp = max_eff_len(ref_lines, True)
+                    ap = max_eff_len(alt_lines, True)
+                    snv_data.append((f"{pos}{ref_allele}>{alt_allele}", ap - rp))
+        if snv_data:
+            labels, deltas = zip(*snv_data)
+            sorted_idx = np.argsort(deltas)
+            labels = [labels[i] for i in sorted_idx]
+            deltas = [deltas[i] for i in sorted_idx]
+            fig, ax = plt.subplots(figsize=(8, max(6, len(labels)*0.3)))
+            ax.barh(range(len(labels)), deltas, color=[COLOR_POS_BAR if d>0 else COLOR_NEG_BAR for d in deltas])
+            ax.set_yticks(range(len(labels)))
+            ax.set_yticklabels(labels, fontsize=7)
+            ax.axvline(0, color='black', linestyle='--')
+            ax.set_xlabel('Δ max perfect length')
+            ax.set_title('Forest plot for SNV (Δ max perfect)')
+            plt.tight_layout()
+            plt.savefig(output_dir / 'forest_snv.png', dpi=150); plt.close()
+            log_print(f" Forest plot сохранён ({len(labels)} мутаций).")
+
     log_print(f"\nВсе результаты в {output_dir}")
     logf.close()
+
+# ============================================================
+#  ALL
+# ============================================================
+def run_all(input_dir, output_dir, ref_path, workers, window_size=0, snv_file=None):
+    cleaned_dir = output_dir / 'cleaned'
+    stats_dir = output_dir / 'stats'
+    ref_seq = read_reference(ref_path)
+    MT_LEN = len(ref_seq)
+    print("=== Этап 1: Очистка ===")
+    txt_files = list(Path(input_dir).glob("*.txt"))
+    if not txt_files:
+        print("Нет .txt файлов в", input_dir); return
+    with ProcessPoolExecutor(max_workers=workers) as ex:
+        futures = {ex.submit(clean_file, f, cleaned_dir, MT_LEN): f for f in txt_files}
+        for future in as_completed(futures):
+            f = futures[future]
+            try: future.result()
+            except Exception as e: print(f"   Ошибка {f.name}: {e}")
+    print("Очистка завершена.")
+    print("=== Этап 2: Статистика ===")
+    run_stats(cleaned_dir, stats_dir, ref_path, workers, window_size, snv_file)
+    print("Полный пайплайн завершён.")
 
 # ============================================================
 #  MAIN
 # ============================================================
 def main():
     parser = argparse.ArgumentParser(description='Анализ повторяемости мтДНК')
-    parser.add_argument('mode', choices=['clean','plot','stats'])
+    parser.add_argument('mode', choices=['clean','plot','stats','all'])
     parser.add_argument('--input_dir', type=str)
     parser.add_argument('--output_dir', type=str)
     parser.add_argument('--workers', type=int, default=8)
-    parser.add_argument('--reference', type=str)
+    parser.add_argument('--reference', type=str, required=True)
+    parser.add_argument('--window_size', type=int, default=0)
+    parser.add_argument('--snv_file', type=str)
     args = parser.parse_args()
 
     if args.mode == 'clean':
         input_dir = Path(args.input_dir or "01KP")
         output_dir = Path(args.output_dir or input_dir / "cleaned")
+        ref_seq = read_reference(args.reference)
+        MT_LEN = len(ref_seq)
         print(f"Режим clean: {input_dir} -> {output_dir}")
-        files = list(input_dir.glob("*.txt"))
-        if not files: print("Нет .txt файлов."); return
+        txt_files = list(input_dir.glob("*.txt"))
+        if not txt_files: print("Нет .txt файлов."); return
         with ProcessPoolExecutor(max_workers=args.workers) as ex:
-            futures = {ex.submit(clean_file, f, output_dir): f for f in files}
+            futures = {ex.submit(clean_file, f, output_dir, MT_LEN): f for f in txt_files}
             for future in as_completed(futures):
                 f = futures[future]
                 try: future.result()
@@ -1049,14 +1131,23 @@ def main():
     elif args.mode == 'plot':
         input_dir = Path(args.input_dir or "mut")
         output_dir = Path(args.output_dir or input_dir / "plots")
-        run_plot(input_dir, output_dir)
+        ref_seq = read_reference(args.reference)
+        MT_LEN = len(ref_seq)
+        run_plot(input_dir, output_dir, MT_LEN)
 
     elif args.mode == 'stats':
-        if not args.input_dir or not args.reference:
-            print("Укажите --input_dir и --reference"); return
+        if not args.input_dir: print("Укажите --input_dir"); return
         input_dir = Path(args.input_dir)
         output_dir = Path(args.output_dir or input_dir / "stats")
-        run_stats(input_dir, output_dir, args.reference, args.workers)
+        run_stats(input_dir, output_dir, args.reference, args.workers,
+                  window_size=args.window_size, snv_file=args.snv_file)
+
+    elif args.mode == 'all':
+        if not args.input_dir: print("Укажите --input_dir"); return
+        input_dir = Path(args.input_dir)
+        output_dir = Path(args.output_dir or input_dir / "results")
+        run_all(input_dir, output_dir, args.reference, args.workers,
+                window_size=args.window_size, snv_file=args.snv_file)
 
 if __name__ == "__main__":
     main()
