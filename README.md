@@ -1,39 +1,106 @@
-# Repeatability
+# Repeatability analysis of human mtDNA
 
-We introduce, estimate, and analyze changes in repeatability — a property of each SNP that quantifies its effect on increasing or decreasing the abundance of direct repeats overlapping the DNA sequence at that position. This property can be biologically relevant for processes such as deletion formation and other DNA alterations.
+We define **repeatability** of a nucleotide position as the maximum effective length of a direct repeat that overlaps that position (allowing a small fraction of mismatches). This property can help understand how single‑nucleotide variants (SNVs) affect the formation of deletions and other structural rearrangements.
 
-# STEP 1:
+This repository contains a full pipeline to:
+- Compute all approximate repeats covering every position and every alternative nucleotide.
+- Clean the raw data (remove self‑repeats, nested repeats, add GC content and H‑bonds).
+- Perform statistical tests (MAD Z‑score) to identify positions where alternative alleles significantly change repeatability.
+- Generate a wide range of publication‑ready figures (Manhattan plots, heatmaps, scatter plots, boxplots, sliding windows, etc.).
+- Compare two genomes (e.g., human vs. pika) using the same metrics.
 
-We define a greedy R function which retrieves a redundant list of repeats overlapping a given position with a given nucleotide. 
-Correctness of this function should be tested (`RetrieveAllRepeatsCoveringGivenPositionAndNucleotideInSequence.R`).
+## Requirements
 
-This function produces repeats, some of which are not biologically adequate:
+- Python ≥ 3.8
+- Packages listed in `requirements.txt` (pandas, numpy, scipy, matplotlib, seaborn, statsmodels, numba, tqdm, biopython)
+- Optional but recommended: `statsmodels` for FDR correction, `numba` for speed.
 
-- Self-repeats: for example, when the motif (motif here is a run of DNA overlapping the position with the nucleotide) equals the repeat (run of DNA identical to the motif but not overlapping the position);
-- Biologically not meaningful cases: when mismatches are located at the start or end (since we allow some degree of degradation);
-- Biologically redundant: when short repeats are nested completely within longer ones.
+Install with:
+```bash
+pip install -r requirements.txt
+```
+## Data
 
-All these problems are acceptable and serve as quality control, confirming that the function works correctly from mathematical and algorithmic viewpoints. That is why we keep all such biologically inadequate cases and filter them out later when deriving various metrics of repeatability.
+Place the reference mitochondrial genome (FASTA) in data/1_raw/Homo_sapiens.mtDNA.fasta.
+Example: NC_012920.1
 
-To do:
+## Usage
 
-- Check the logic of the function (compare outputs, verify manually);
-- Ask a python/C++ expert to code it for faster performance.
+All functionality is accessible via the command‑line interface repeat_analysis.cli.
+Run python -m repeat_analysis.cli --help to see available commands.
+Main commands
+Command	Description
+generate	Run the repeat finder for every position and nucleotide (takes many hours).
+clean	Filter raw output: remove self‑repeats, nested repeats, add GC/H‑bonds.
+stats	Compute all statistical tests and generate ~20 figures.
+plot	Quick ΔR bar plot and forest plot for six model SNPs.
+compare	Compare two genomes (e.g., human vs. pika) – produces comparison plots.
 
-# STEP 2:
+## Typical workflow (from scratch)
+```bash
+# 1. Generate raw repeat files (only once)
+python -m repeat_analysis.cli generate \
+    --fasta data/1_raw/Homo_sapiens.mtDNA.fasta \
+    --outdir data/2_derived/01KP \
+    --max-workers 32
 
-Run this function on all mtDNA positions and all nucleotides, and save outputs.
+# 2. Clean
+python -m repeat_analysis.cli clean \
+    --input_dir data/2_derived/01KP \
+    --output_dir data/3_results/cleaned \
+    --reference data/1_raw/Homo_sapiens.mtDNA.fasta \
+    --workers 32
 
-# STEP 3:
+# 3. Full statistical analysis and figures
+python -m repeat_analysis.cli stats \
+    --input_dir data/3_results/cleaned \
+    --output_dir data/3_results/stats \
+    --reference data/1_raw/Homo_sapiens.mtDNA.fasta \
+    --workers 32 \
+    --window_size 200
 
-Derive repeatability metrics and perform descriptive statistics of repeatability for different positions, sites, and model mutations (mutations known to be associated with specific phenotypes).
+# 4. (Optional) Simple plots for the six model SNPs
+python -m repeat_analysis.cli plot \
+    --input_dir data/3_results/cleaned \
+    --output_dir data/3_results/plots \
+    --reference data/1_raw/Homo_sapiens.mtDNA.fasta
+```
 
-# STEP 4:
+## Running on a SLURM cluster
 
-Consider extensions:
+A ready‑to‑use submission script is provided in slurm/run_all.slurm.
+Adjust the paths, partition, email, and module loads, then run:
+bash
 
-- Visualisation of potential deletions (e.g., using R Shiny, circus plots);
-- Analysis of ssDNA and ssRNA viral genomes;
-- When fast code becomes available, analysis of interactions (epistasis) between different variants (probably focusing on closely located synonymous mutations separately, but never together).
-- Analyse other mammalian/vertebrate mtDNAs
+``` bash
+sbatch slurm/run_all.slurm
+```
 
+## Comparing two genomes
+```bash
+
+python -m repeat_analysis.cli compare \
+    --input_dir1 data/human/cleaned \
+    --reference1 data/human/ref.fasta \
+    --input_dir2 data/pika/cleaned \
+    --reference2 data/pika/ref.fasta \
+    --name1 Human --name2 Pika \
+    --output_dir comparison_results
+```
+
+## Output
+
+All results are saved in the specified output directories.
+For the stats command, typical outputs include:
+    manhattan_metrics.png – Manhattan plots for 7 repeatability metrics.
+    coverage_plot.png – weighted coverage along the genome.
+    heatmap_max_perfect.png – heatmap of Δ max perfect repeat.
+    scatter_delta_perfect.png – scatter plot with regression.
+    boxplot_99percentile_*.png – 99th percentile of |Δ| for transitions/transversions.
+    windowed_* – sliding window bar plots (if --window_size > 0).
+    stats_run.log – detailed log of all tests.
+
+## Citation
+
+If you use this pipeline, please cite the original concept and this implementation.
+(Add your own citation when published.)
