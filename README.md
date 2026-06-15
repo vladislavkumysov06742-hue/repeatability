@@ -95,13 +95,13 @@ A ready‑to‑use submission script is provided in `slurm/run_all.slurm`.
 Adjust the paths, partition, email, and module loads, then run:
 
 ```bash
-sbatch slurm/run_all.slurm --fasta /path/to/mtDNA.fasta
+sbatch slurm/run_full_pipeline.slurm --fasta /path/to/mtDNA.fasta
 ```
 
 Optionally, provide a second FASTA for cross‑species comparison:
 
 ```bash
-sbatch slurm/run_all.slurm --fasta human.fasta --pika_fasta pika.fasta
+sbatch slurm/run_full_pipeline.slurm --fasta human.fasta --pika_fasta pika.fasta
 ```
 
 The script will:
