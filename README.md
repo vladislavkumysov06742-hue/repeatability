@@ -52,20 +52,20 @@ Run `python -m repeat_analysis.cli --help` to see available commands.
 
 | Command   | Description |
 |-----------|-------------|
-| `generate`| Run the repeat finder for every position and nucleotide (takes many hours). |
 | `clean`   | Filter raw output: remove self‑repeats, nested repeats, add GC/H‑bonds. |
 | `stats`   | Compute all statistical tests and generate ~20 figures. |
 | `plot`    | Quick ΔR bar plot and forest plot for six model SNPs. |
+| `all`     | Run clean + stats in one go (but not the raw repeat generation). |
 | `compare` | Compare two genomes (e.g., human vs. pika) – produces comparison plots. |
 
 ### Typical workflow (from scratch)
 
 ```bash
-# 1. Generate raw repeat files (only once)
-python -m repeat_analysis.cli generate \
+# 1. Generate raw repeat files (using the notebook script, not the CLI)
+python notebooks/01B.KP.RunTheFunctionOnWholeMtDna.py \
     --fasta data/1_raw/Homo_sapiens.mtDNA.fasta \
     --outdir data/2_derived/01KP \
-    --max-workers 32
+    --workers 32
 
 # 2. Clean
 python -m repeat_analysis.cli clean \
